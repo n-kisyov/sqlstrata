@@ -2,7 +2,15 @@
 
 Native, pure-Go (`CGO_ENABLED=0`) SQLite GUI editor for Windows 11 built with [Gio](https://gioui.org) and [`ncruces/go-sqlite3`](https://github.com/ncruces/go-sqlite3).
 
-Jump to: [Features](#features) · [Keyboard Shortcuts](#keyboard-shortcuts) · [Build & Run](#build--run) · [Project Layout](#project-layout)
+Jump to: [Screenshots](#screenshots) · [Features](#features) · [Keyboard Shortcuts](#keyboard-shortcuts) · [Build & Run](#build--run) · [Project Layout](#project-layout)
+
+## Screenshots
+
+![SQLStrata Browse Data & Cell Inspector](docs/screenshots/browse_inspector.png)
+
+| Execute SQL & Results | Structure & DDL Designer |
+| :---: | :---: |
+| ![Execute SQL](docs/screenshots/sql_runner.png) | ![Structure View](docs/screenshots/structure_view.png) |
 
 ## Features
 
