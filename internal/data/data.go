@@ -86,4 +86,3 @@ func FormatSize(n int64) string {
 	}
 	return strconv.FormatFloat(v, 'f', prec, 64) + " " + string("KMGTPE"[exp]) + "B"
 }
-

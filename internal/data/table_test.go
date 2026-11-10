@@ -10,6 +10,7 @@ import (
 
 	"github.com/ncruces/go-sqlite3"
 
+	"github.com/sqlstrata/sqlstrata/internal/edit"
 	"github.com/sqlstrata/sqlstrata/internal/engine"
 )
 
@@ -207,5 +208,93 @@ func TestFormatSize(t *testing.T) {
 		if got := FormatSize(in); got != want {
 			t.Errorf("FormatSize(%d) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestBigDBOpenAndPageLatency(t *testing.T) {
+	path := filepath.Join("..", "..", "testdata", "big.db")
+	if _, err := filepath.Abs(path); err != nil {
+		t.Skip(err)
+	}
+	t0 := time.Now()
+	db, err := engine.Open(path, engine.DefaultOptions())
+	if err != nil {
+		t.Skipf("big.db not available: %v", err)
+	}
+	defer db.Close()
+
+	var schema *engine.Schema
+	if err := db.Fg.Do(t.Context(), func(c *sqlite3.Conn) error {
+		var err error
+		schema, err = engine.LoadSchema(c)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	openDur := time.Since(t0)
+
+	orders := schema.Find("orders")
+	if orders == nil {
+		t.Fatal("orders table missing in big.db")
+	}
+	ch := make(chan struct{}, 1)
+	t1 := time.Now()
+	src := NewTableSource(db, orders, SourceOptions{CacheBudget: 32 << 20}, func() {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	})
+	defer src.Close()
+
+	got, kind := loadCell(t, src, ch, 0, 0)
+	firstPageDur := time.Since(t1)
+	if got != "1" || kind != KindInteger {
+		t.Fatalf("first cell = %q (%v)", got, kind)
+	}
+	t.Logf("big.db (20M rows): open+schema=%s, first-page=%s, cache=%s",
+		openDur.Round(time.Microsecond), firstPageDur.Round(time.Microsecond), FormatSize(int64(src.CacheBytes())))
+	if openDur > time.Second {
+		t.Errorf("open+schema took %s (> 1s target)", openDur)
+	}
+	if firstPageDur > 100*time.Millisecond {
+		t.Errorf("first page took %s (> 100ms target)", firstPageDur)
+	}
+}
+
+func TestTableSourceSortFilterAndStagedEdit(t *testing.T) {
+	path, ids := makeDB(t, 1000)
+	src, ch := openSource(t, path, "t")
+	_ = waitExact(t, src, ch)
+
+	// 1. Sort descending by id (col 0, which is RowidAlias).
+	src.SetSort(0, true)
+	got, _ := loadCell(t, src, ch, 0, 0)
+	if want := strconv.FormatInt(ids[len(ids)-1], 10); got != want {
+		t.Fatalf("desc sort row 0 id = %q, want %s", got, want)
+	}
+
+	// 2. Reset sort and apply a filter.
+	src.SetSort(-1, false)
+	targetID := ids[42]
+	src.SetFilter(fmt.Sprintf("id = %d", targetID))
+	if n := waitExact(t, src, ch); n != 1 {
+		t.Fatalf("filtered count = %d, want 1", n)
+	}
+	got, _ = loadCell(t, src, ch, 0, 1)
+	if want := "row" + strconv.FormatInt(targetID, 10); got != want {
+		t.Fatalf("filtered name = %q, want %q", got, want)
+	}
+
+	// 3. Stage an edit on the filtered row and verify overlay + CellStatus.
+	if !src.StageCellEdit(0, 1, edit.TextValue("updated_name")) {
+		t.Fatal("StageCellEdit failed")
+	}
+	if edited, del, ins := src.CellStatus(0, 1); !edited || del || ins {
+		t.Fatalf("unexpected CellStatus: edited=%v del=%v ins=%v", edited, del, ins)
+	}
+	got, _ = loadCell(t, src, ch, 0, 1)
+	if got != "updated_name" {
+		t.Fatalf("staged cell = %q, want updated_name", got)
 	}
 }

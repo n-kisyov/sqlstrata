@@ -1,14 +1,16 @@
 package main
 
 import (
-	"net/url"
+	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
 
 func init() {
 	drivers["modernc"] = func(path string, ro bool) string {
-		dsn := "file:" + url.PathEscape(path)
+		esc := strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23").Replace(filepath.ToSlash(path))
+		dsn := "file:" + esc
 		if ro {
 			dsn += "?mode=ro"
 		}

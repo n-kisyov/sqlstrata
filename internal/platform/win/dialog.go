@@ -4,7 +4,7 @@ package win
 
 import (
 	"runtime"
-	"strings"
+	"unicode/utf16"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -58,15 +58,7 @@ func OpenFile(owner uintptr, title string, filters []Filter) (path string, ok bo
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	var f strings.Builder
-	for _, flt := range filters {
-		f.WriteString(flt.Name)
-		f.WriteByte(0)
-		f.WriteString(flt.Pattern)
-		f.WriteByte(0)
-	}
-	f.WriteByte(0)
-	filter := windows.StringToUTF16(f.String()) // keeps embedded NULs
+	filter := encodeFilter(filters)
 
 	buf := make([]uint16, 32*1024)
 	ofn := openFileNameW{
@@ -87,3 +79,15 @@ func OpenFile(owner uintptr, title string, filters []Filter) (path string, ok bo
 	return windows.UTF16ToString(buf), true
 }
 
+// encodeFilter builds the double-NUL-terminated UTF-16 filter block required
+// by OPENFILENAMEW (windows.StringToUTF16 rejects strings containing NUL).
+func encodeFilter(filters []Filter) []uint16 {
+	var out []uint16
+	for _, flt := range filters {
+		out = append(out, utf16.Encode([]rune(flt.Name))...)
+		out = append(out, 0)
+		out = append(out, utf16.Encode([]rune(flt.Pattern))...)
+		out = append(out, 0)
+	}
+	return append(out, 0, 0)
+}

@@ -23,14 +23,14 @@ var (
 
 // DWM window attributes (dwmapi.h, Windows 11).
 const (
-	dwmwaUseImmersiveDarkMode  = 20
-	dwmwaWindowCornerPref      = 33
-	dwmwaBorderColor           = 34
-	dwmwaCaptionColor          = 35
-	dwmwaTextColor             = 36
-	dwmwaSystemBackdropType    = 38
-	dwmwcpRound                = 2
-	dwmsbtNone                 = 1
+	dwmwaUseImmersiveDarkMode = 20
+	dwmwaWindowCornerPref     = 33
+	dwmwaBorderColor          = 34
+	dwmwaCaptionColor         = 35
+	dwmwaTextColor            = 36
+	dwmwaSystemBackdropType   = 38
+	dwmwcpRound               = 2
+	dwmsbtNone                = 1
 )
 
 // SystemDarkMode reports whether the user chose dark mode for apps.
@@ -111,4 +111,3 @@ func FontPath(names ...string) (string, bool) {
 	}
 	return "", false
 }
-
