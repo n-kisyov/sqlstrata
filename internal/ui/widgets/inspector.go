@@ -166,10 +166,12 @@ func (ins *Inspector) rebuildLines() {
 			ins.lines = strings.Split(out.String(), "\n")
 		} else {
 			ins.lines = append(ins.lines, "(Not valid JSON)", "")
-			ins.lines = append(ins.lines, strings.Split(strings.ReplaceAll(string(ins.raw), "\r\n", "\n"), "\n")...)
+			norm := strings.NewReplacer("\r\n", "\n", "\t", "    ").Replace(string(ins.raw))
+			ins.lines = append(ins.lines, strings.Split(norm, "\n")...)
 		}
 	default:
-		ins.lines = strings.Split(strings.ReplaceAll(string(ins.raw), "\r\n", "\n"), "\n")
+		norm := strings.NewReplacer("\r\n", "\n", "\t", "    ").Replace(string(ins.raw))
+		ins.lines = strings.Split(norm, "\n")
 	}
 }
 

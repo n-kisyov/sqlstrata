@@ -4,6 +4,7 @@ package win
 
 import (
 	"runtime"
+	"strings"
 	"unicode/utf16"
 	"unsafe"
 
@@ -13,6 +14,7 @@ import (
 var (
 	comdlg32             = windows.NewLazySystemDLL("comdlg32.dll")
 	procGetOpenFileNameW = comdlg32.NewProc("GetOpenFileNameW")
+	procGetSaveFileNameW = comdlg32.NewProc("GetSaveFileNameW")
 )
 
 // openFileNameW mirrors OPENFILENAMEW.
@@ -43,10 +45,11 @@ type openFileNameW struct {
 }
 
 const (
-	ofnFileMustExist = 0x00001000
-	ofnPathMustExist = 0x00000800
-	ofnExplorer      = 0x00080000
-	ofnNoChangeDir   = 0x00000008
+	ofnOverwritePrompt = 0x00000002
+	ofnNoChangeDir     = 0x00000008
+	ofnPathMustExist   = 0x00000800
+	ofnFileMustExist   = 0x00001000
+	ofnExplorer        = 0x00080000
 )
 
 // Filter is a file dialog filter, e.g. {"SQLite databases", "*.db;*.sqlite"}.
@@ -55,24 +58,47 @@ type Filter struct{ Name, Pattern string }
 // OpenFile shows the native Open dialog. It blocks, so call it from a
 // goroutine other than the UI loop. ok is false if the user cancelled.
 func OpenFile(owner uintptr, title string, filters []Filter) (path string, ok bool) {
+	return runFileDialog(procGetOpenFileNameW, owner, title, "", "", filters,
+		ofnFileMustExist|ofnPathMustExist|ofnExplorer|ofnNoChangeDir)
+}
+
+// SaveFile shows the native Save As dialog. It blocks, so call it from a
+// goroutine other than the UI loop. defaultName and defaultExt (without dot)
+// are optional.
+func SaveFile(owner uintptr, title, defaultName, defaultExt string, filters []Filter) (path string, ok bool) {
+	return runFileDialog(procGetSaveFileNameW, owner, title, defaultName, strings.TrimPrefix(defaultExt, "."), filters,
+		ofnOverwritePrompt|ofnPathMustExist|ofnExplorer|ofnNoChangeDir)
+}
+
+func runFileDialog(proc *windows.LazyProc, owner uintptr, title, defaultName, defaultExt string, filters []Filter, flags uint32) (string, bool) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	filter := encodeFilter(filters)
-
 	buf := make([]uint16, 32*1024)
+	if defaultName != "" {
+		u16 := utf16.Encode([]rune(defaultName))
+		if len(u16) >= len(buf) {
+			u16 = u16[:len(buf)-1]
+		}
+		copy(buf, u16)
+	}
+
 	ofn := openFileNameW{
 		hwndOwner:   owner,
 		lpstrFilter: &filter[0],
 		lpstrFile:   &buf[0],
 		nMaxFile:    uint32(len(buf)),
-		flags:       ofnFileMustExist | ofnPathMustExist | ofnExplorer | ofnNoChangeDir,
+		flags:       flags,
 	}
 	ofn.lStructSize = uint32(unsafe.Sizeof(ofn))
 	if title != "" {
 		ofn.lpstrTitle, _ = windows.UTF16PtrFromString(title)
 	}
-	r, _, _ := procGetOpenFileNameW.Call(uintptr(unsafe.Pointer(&ofn)))
+	if defaultExt != "" {
+		ofn.lpstrDefExt, _ = windows.UTF16PtrFromString(defaultExt)
+	}
+	r, _, _ := proc.Call(uintptr(unsafe.Pointer(&ofn)))
 	if r == 0 {
 		return "", false
 	}

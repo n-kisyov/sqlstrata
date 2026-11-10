@@ -6,6 +6,7 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -184,6 +185,20 @@ func TestSelectIndexShowsStructure(t *testing.T) {
 	ui.layout(gtx)
 	if err := hw.Frame(&ops); err != nil {
 		t.Fatal(err)
+	}
+
+	// Verify DDL display strips/expands raw tab characters so Gio never renders tofu boxes.
+	viewObj := schema.Find("big_orders")
+	if viewObj == nil || viewObj.Type != engine.TypeView {
+		t.Fatalf("big_orders view not found: %+v", viewObj)
+	}
+	ui.loadStructure(viewObj)
+	ddl := ui.ddlEdit.Text()
+	if strings.ContainsRune(ddl, '\t') {
+		t.Fatalf("DDL still contains raw tab characters:\n%s", ddl)
+	}
+	if !strings.Contains(ddl, "    SELECT") {
+		t.Fatalf("expected 4-space indentation in DDL display, got:\n%s", ddl)
 	}
 }
 

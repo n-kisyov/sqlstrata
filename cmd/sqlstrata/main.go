@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"image"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -15,11 +14,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"gioui.org/app"
 	"gioui.org/font"
 	"gioui.org/gesture"
-	"gioui.org/io/clipboard"
 	"gioui.org/io/key"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
@@ -32,6 +31,7 @@ import (
 
 	"github.com/ncruces/go-sqlite3"
 
+	sqlapp "github.com/sqlstrata/sqlstrata/internal/app"
 	"github.com/sqlstrata/sqlstrata/internal/data"
 	"github.com/sqlstrata/sqlstrata/internal/edit"
 	"github.com/sqlstrata/sqlstrata/internal/engine"
@@ -41,6 +41,7 @@ import (
 )
 
 func main() {
+	ro := flag.Bool("ro", false, "open initial database read-only")
 	flag.Parse()
 	initialPath := flag.Arg(0)
 
@@ -52,8 +53,9 @@ func main() {
 			app.MinSize(unit.Dp(720), unit.Dp(480)),
 		)
 		ui := newUI(w)
+		ui.initSession()
 		if initialPath != "" {
-			ui.openDatabase(initialPath)
+			ui.openDatabase(initialPath, *ro)
 		}
 		if err := ui.run(); err != nil {
 			log.Fatal(err)
@@ -69,6 +71,7 @@ const (
 	tabBrowse viewTab = iota
 	tabSQL
 	tabStructure
+	tabTools
 	tabReview
 )
 
@@ -86,6 +89,7 @@ type uiState struct {
 	browseGrid *widgets.DataGrid
 	sqlGrid    *widgets.DataGrid
 	structGrid *widgets.DataGrid
+	toolsGrid  *widgets.DataGrid
 	inspector  *widgets.Inspector
 
 	activeTab  viewTab
@@ -101,12 +105,22 @@ type uiState struct {
 	btnTabBrowse    gesture.Click
 	btnTabSQL       gesture.Click
 	btnTabStructure gesture.Click
+	btnTabTools     gesture.Click
 	btnTabReview    gesture.Click
-	btnRunSQL       gesture.Click
-	btnCancelSQL    gesture.Click
 	btnSidebar      gesture.Click
 	btnInspector    gesture.Click
 	btnTheme        gesture.Click
+
+	// SQL view buttons & state.
+	btnRunSQL        gesture.Click
+	btnCancelSQL     gesture.Click
+	btnRunSQLFile    gesture.Click
+	btnSQLHistory    gesture.Click
+	btnSQLExpCSV     gesture.Click
+	btnSQLExpJSON    gesture.Click
+	sqlHistoryOpen   bool
+	sqlSuggestClicks []gesture.Click
+	sqlHistClicks    []gesture.Click
 
 	// Structure view buttons.
 	btnBrowseTarget gesture.Click
@@ -114,12 +128,29 @@ type uiState struct {
 	btnCopyDDL      gesture.Click
 	structRelClicks []gesture.Click
 
+	// DB tools buttons.
+	btnToolsRefresh    gesture.Click
+	btnToolsQuickChk   gesture.Click
+	btnToolsIntegChk   gesture.Click
+	btnToolsFKChk      gesture.Click
+	btnToolsOptimize   gesture.Click
+	btnToolsVacuumInto gesture.Click
+
+	// Welcome screen buttons.
+	btnWelOpen   gesture.Click
+	btnWelOpenRO gesture.Click
+	btnWelNew    gesture.Click
+	btnWelDemo   gesture.Click
+	recentClicks []gesture.Click
+
 	// Browse sub-toolbar buttons.
 	btnApplyFilter gesture.Click
 	btnClearFilter gesture.Click
 	btnAddRow      gesture.Click
 	btnUndo        gesture.Click
 	btnRedo        gesture.Click
+	btnBrowseCSV   gesture.Click
+	btnBrowseJSON  gesture.Click
 	btnCommit      gesture.Click
 	btnDiscard     gesture.Click
 
@@ -128,9 +159,10 @@ type uiState struct {
 	paletteEdit   widget.Editor
 	paletteList   layout.List
 	paletteClicks []gesture.Click
-	paletteBg     gesture.Click
 
 	mu          sync.Mutex
+	sessionPath string
+	session     *sqlapp.Session
 	db          *engine.DB
 	dbSize      int64
 	schema      *engine.Schema
@@ -139,6 +171,7 @@ type uiState struct {
 	structObj   *engine.Object
 	structIndex *engine.IndexInfo
 	structRel   []*engine.Object
+	toolsStatus string
 	statusMsg   string
 	sqlRunning  bool
 	sqlCancel   context.CancelFunc
@@ -152,15 +185,17 @@ func newUI(w *app.Window) *uiState {
 		th:          th,
 		leftSplit:   widgets.Splitter{Axis: layout.Horizontal, Size: 250, Min: 170, Max: 520},
 		rightSplit:  widgets.Splitter{Axis: layout.Horizontal, Size: 320, Min: 220, Max: 560, SecondFixed: true},
-		sqlSplit:    widgets.Splitter{Axis: layout.Vertical, Size: 180, Min: 90, Max: 520},
+		sqlSplit:    widgets.Splitter{Axis: layout.Vertical, Size: 200, Min: 100, Max: 520},
 		structSplit: widgets.Splitter{Axis: layout.Vertical, Size: 230, Min: 100, Max: 520},
 		tree:        widgets.NewTreeView(),
 		browseGrid:  widgets.NewDataGrid(),
 		sqlGrid:     widgets.NewDataGrid(),
 		structGrid:  widgets.NewDataGrid(),
+		toolsGrid:   widgets.NewDataGrid(),
 		inspector:   widgets.NewInspector(),
 		reviewList:  layout.List{Axis: layout.Vertical},
 		paletteList: layout.List{Axis: layout.Vertical},
+		session:     &sqlapp.Session{},
 		statusMsg:   "Ready · Open a SQLite file (Ctrl+O) or try the 100M-row Demo",
 	}
 	u.ddlEdit.ReadOnly = true
@@ -182,6 +217,17 @@ func newUI(w *app.Window) *uiState {
 	u.sqlGrid.OnSelectCell = func(row int64, col int) {
 		u.inspectFrom(u.sqlGrid, row, col)
 	}
+	onCopy := func(val string) {
+		if len(val) > 48 {
+			val = val[:48] + "…"
+		}
+		u.setStatus("Copied to clipboard: " + val)
+	}
+	u.browseGrid.OnCopy = onCopy
+	u.sqlGrid.OnCopy = onCopy
+	u.structGrid.OnCopy = onCopy
+	u.toolsGrid.OnCopy = onCopy
+
 	u.inspector.OnStageCell = func(row int64, col int, val edit.Value) {
 		u.mu.Lock()
 		src := u.tableSrc
@@ -203,6 +249,49 @@ func newUI(w *app.Window) *uiState {
 		}
 	}
 	return u
+}
+
+func (u *uiState) initSession() {
+	p, err := sqlapp.DefaultSessionPath()
+	if err != nil {
+		return
+	}
+	s, _ := sqlapp.LoadSession(p)
+	u.mu.Lock()
+	u.sessionPath = p
+	u.session = s
+	u.mu.Unlock()
+
+	if s.ThemeSet && s.DarkTheme != u.th.Dark {
+		accent := u.th.Accent
+		if a, ok := win.AccentColor(); ok {
+			accent = a
+		}
+		u.th.SetDark(s.DarkTheme, accent)
+		u.applyWindowStyle()
+	}
+}
+
+func (u *uiState) persistSessionLocked() {
+	if u.sessionPath == "" || u.session == nil {
+		return
+	}
+	cp := *u.session
+	cp.RecentFiles = append([]string(nil), u.session.RecentFiles...)
+	cp.QueryHistory = append([]string(nil), u.session.QueryHistory...)
+	path := u.sessionPath
+	go func() {
+		_ = cp.Save(path)
+	}()
+}
+
+func (u *uiState) saveQueryHistory(sql string) {
+	u.mu.Lock()
+	if u.session != nil {
+		u.session.AddQuery(sql)
+		u.persistSessionLocked()
+	}
+	u.mu.Unlock()
 }
 
 func (u *uiState) inspectFrom(g *widgets.DataGrid, row int64, col int) {
@@ -241,31 +330,36 @@ func (u *uiState) applyWindowStyle() {
 	}
 }
 
-func (u *uiState) openDialog() {
+func (u *uiState) openDialog(readOnly bool) {
 	hwnd := u.hwnd
+	title := "Open SQLite Database"
+	if readOnly {
+		title = "Open SQLite Database (Read-Only)"
+	}
 	go func() {
-		path, ok := win.OpenFile(hwnd, "Open SQLite Database", []win.Filter{
+		path, ok := win.OpenFile(hwnd, title, []win.Filter{
 			{Name: "SQLite Databases (*.db;*.sqlite;*.sqlite3)", Pattern: "*.db;*.sqlite;*.sqlite3;*.db3"},
 			{Name: "All Files (*.*)", Pattern: "*.*"},
 		})
 		if ok && path != "" {
-			u.openDatabase(path)
+			u.openDatabase(path, readOnly)
 		}
 	}()
 }
 
-func (u *uiState) openDatabase(path string) {
+func (u *uiState) openDatabase(path string, readOnly bool) {
 	go func() {
 		start := time.Now()
-		fi, err := os.Stat(path)
+		opt := engine.DefaultOptions()
+		opt.ReadOnly = readOnly
+		db, err := engine.Open(path, opt)
 		if err != nil {
 			u.setStatus(fmt.Sprintf("Open failed: %v", err))
 			return
 		}
-		db, err := engine.Open(path, engine.DefaultOptions())
-		if err != nil {
-			u.setStatus(fmt.Sprintf("Open failed: %v", err))
-			return
+		var dbSize int64
+		if fi, serr := os.Stat(path); serr == nil {
+			dbSize = fi.Size()
 		}
 		var schema *engine.Schema
 		err = db.Fg.Do(context.Background(), func(c *sqlite3.Conn) error {
@@ -283,11 +377,23 @@ func (u *uiState) openDatabase(path string) {
 		oldDB := u.db
 		oldSrc := u.tableSrc
 		u.db = db
-		u.dbSize = fi.Size()
+		u.dbSize = dbSize
 		u.schema = schema
 		u.tableSrc = nil
 		u.activeTable = ""
-		u.statusMsg = fmt.Sprintf("Opened %s in %s", filepath.Base(path), time.Since(start).Round(time.Millisecond))
+		u.structObj = nil
+		u.structIndex = nil
+		u.structRel = nil
+		u.toolsStatus = ""
+		modeTag := ""
+		if readOnly {
+			modeTag = " [Read-Only]"
+		}
+		u.statusMsg = fmt.Sprintf("Opened %s%s in %s", filepath.Base(path), modeTag, time.Since(start).Round(time.Millisecond))
+		if u.session != nil {
+			u.session.AddRecent(path)
+			u.persistSessionLocked()
+		}
 		u.mu.Unlock()
 
 		if oldSrc != nil {
@@ -298,7 +404,11 @@ func (u *uiState) openDatabase(path string) {
 		}
 
 		u.tree.SetSchema(schema)
-		u.win.Option(app.Title("SQLStrata — " + filepath.Base(path)))
+		u.browseGrid.SetSource(nil)
+		u.structGrid.SetSource(nil)
+		u.inspector.Clear()
+		u.refreshToolsInfo()
+		u.win.Option(app.Title("SQLStrata — " + filepath.Base(path) + modeTag))
 
 		if tables := schema.ByType(engine.TypeTable); len(tables) > 0 {
 			u.tree.SelectObject(tables[0])
@@ -306,6 +416,10 @@ func (u *uiState) openDatabase(path string) {
 		} else if len(schema.Objects) > 0 {
 			u.tree.SelectObject(schema.Objects[0])
 			u.selectObject(schema.Objects[0])
+		} else {
+			u.mu.Lock()
+			u.activeTab = tabSQL
+			u.mu.Unlock()
 		}
 		u.win.Invalidate()
 	}()
@@ -355,161 +469,6 @@ func (u *uiState) selectObject(obj *engine.Object) {
 	u.browseGrid.SetSource(src)
 	u.inspector.Clear()
 	u.win.Invalidate()
-}
-
-func (u *uiState) loadStructure(obj *engine.Object) {
-	u.mu.Lock()
-	db := u.db
-	schema := u.schema
-	u.structObj = obj
-	u.structIndex = nil
-	tableName := obj.Name
-	if obj.Table != "" {
-		tableName = obj.Table
-	}
-	var rel []*engine.Object
-	if schema != nil && tableName != "" {
-		rel = append(rel, schema.Related(tableName, engine.TypeIndex)...)
-		rel = append(rel, schema.Related(tableName, engine.TypeTrigger)...)
-	}
-	u.structRel = rel
-	u.mu.Unlock()
-
-	ddl := strings.TrimSpace(obj.SQL)
-	if ddl != "" && !strings.HasSuffix(ddl, ";") {
-		ddl += ";"
-	}
-	if ddl == "" {
-		ddl = "-- (Internal or auto-generated SQLite schema object)"
-	}
-	u.ddlEdit.SetText(ddl)
-
-	switch obj.Type {
-	case engine.TypeTable, engine.TypeView:
-		u.structGrid.SetSource(buildTableStructSource(obj))
-	case engine.TypeTrigger:
-		u.structGrid.SetSource(buildTriggerStructSource(obj))
-	case engine.TypeIndex:
-		u.structGrid.SetSource(buildIndexStructSource(obj, nil))
-		if db != nil {
-			db.Fg.Go(context.Background(), func(c *sqlite3.Conn) error {
-				info, err := engine.LoadIndexInfo(c, obj)
-				if err != nil {
-					return err
-				}
-				u.mu.Lock()
-				stillSelected := u.structObj == obj
-				if stillSelected {
-					u.structIndex = info
-				}
-				u.mu.Unlock()
-				if stillSelected {
-					u.structGrid.SetSource(buildIndexStructSource(obj, info))
-					u.win.Invalidate()
-				}
-				return nil
-			}, nil)
-		}
-	}
-}
-
-func buildTableStructSource(obj *engine.Object) *data.StaticSource {
-	src := data.NewStaticSource([]data.Column{
-		{Name: "cid", Type: "INTEGER", PK: true},
-		{Name: "column", Type: "TEXT"},
-		{Name: "type", Type: "TEXT"},
-		{Name: "nullable", Type: "TEXT"},
-		{Name: "default", Type: "TEXT"},
-		{Name: "pk", Type: "INTEGER"},
-		{Name: "flags", Type: "TEXT"},
-	})
-	for i, c := range obj.Columns {
-		src.AppendCell([]byte(strconv.Itoa(i)), data.KindInteger)
-		src.AppendCell([]byte(c.Name), data.KindText)
-		if c.Type != "" {
-			src.AppendCell([]byte(c.Type), data.KindText)
-		} else {
-			src.AppendCell(nil, data.KindNull)
-		}
-		if c.NotNull {
-			src.AppendCell([]byte("NOT NULL"), data.KindText)
-		} else {
-			src.AppendCell([]byte("NULL"), data.KindText)
-		}
-		if c.HasDflt {
-			src.AppendCell([]byte(c.Default), data.KindText)
-		} else {
-			src.AppendCell(nil, data.KindNull)
-		}
-		if c.PK > 0 {
-			src.AppendCell([]byte(strconv.Itoa(c.PK)), data.KindInteger)
-		} else {
-			src.AppendCell(nil, data.KindNull)
-		}
-		var flags []string
-		if obj.RowidAlias != "" && c.Name == obj.RowidAlias {
-			flags = append(flags, "ROWID ALIAS")
-		}
-		switch c.Hidden {
-		case 2:
-			flags = append(flags, "GENERATED VIRTUAL")
-		case 3:
-			flags = append(flags, "GENERATED STORED")
-		}
-		if len(flags) > 0 {
-			src.AppendCell([]byte(strings.Join(flags, ", ")), data.KindText)
-		} else {
-			src.AppendCell(nil, data.KindNull)
-		}
-	}
-	return src
-}
-
-func buildIndexStructSource(obj *engine.Object, info *engine.IndexInfo) *data.StaticSource {
-	src := data.NewStaticSource([]data.Column{
-		{Name: "seqno", Type: "INTEGER", PK: true},
-		{Name: "column", Type: "TEXT"},
-		{Name: "order", Type: "TEXT"},
-		{Name: "collation", Type: "TEXT"},
-		{Name: "role", Type: "TEXT"},
-	})
-	if info == nil {
-		return src
-	}
-	for _, c := range info.Columns {
-		src.AppendCell([]byte(strconv.Itoa(c.Seqno)), data.KindInteger)
-		src.AppendCell([]byte(c.Name), data.KindText)
-		if c.Desc {
-			src.AppendCell([]byte("DESC"), data.KindText)
-		} else {
-			src.AppendCell([]byte("ASC"), data.KindText)
-		}
-		if c.Coll != "" {
-			src.AppendCell([]byte(c.Coll), data.KindText)
-		} else {
-			src.AppendCell(nil, data.KindNull)
-		}
-		if c.Key {
-			src.AppendCell([]byte("Index Key"), data.KindText)
-		} else {
-			src.AppendCell([]byte("Auxiliary (locator)"), data.KindText)
-		}
-	}
-	return src
-}
-
-func buildTriggerStructSource(obj *engine.Object) *data.StaticSource {
-	src := data.NewStaticSource([]data.Column{
-		{Name: "property", Type: "TEXT"},
-		{Name: "value", Type: "TEXT"},
-	})
-	src.AppendCell([]byte("Object Type"), data.KindText)
-	src.AppendCell([]byte("Trigger"), data.KindText)
-	src.AppendCell([]byte("Name"), data.KindText)
-	src.AppendCell([]byte(obj.Name), data.KindText)
-	src.AppendCell([]byte("Target Table"), data.KindText)
-	src.AppendCell([]byte(obj.Table), data.KindText)
-	return src
 }
 
 func (u *uiState) loadDemo100M() {
@@ -569,105 +528,6 @@ func (u *uiState) discardChanges() {
 	u.win.Invalidate()
 }
 
-func (u *uiState) runSQL() {
-	u.mu.Lock()
-	db := u.db
-	if db == nil {
-		u.sqlStatus = "Open a database first to run SQL."
-		u.mu.Unlock()
-		u.win.Invalidate()
-		return
-	}
-	if u.sqlRunning {
-		u.mu.Unlock()
-		return
-	}
-	sqlText := strings.TrimSpace(u.sqlEdit.Text())
-	if sqlText == "" {
-		u.mu.Unlock()
-		return
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	u.sqlRunning = true
-	u.sqlCancel = cancel
-	u.sqlStatus = "Running query…"
-	u.mu.Unlock()
-	u.win.Invalidate()
-
-	go func() {
-		start := time.Now()
-		var res *data.StaticSource
-		var rowsRead int64
-		const rowCap = 10_000
-
-		err := db.Fg.Do(ctx, func(c *sqlite3.Conn) error {
-			stmt, _, err := c.Prepare(sqlText)
-			if err != nil {
-				return err
-			}
-			defer stmt.Close()
-
-			ncols := stmt.ColumnCount()
-			if ncols == 0 {
-				return stmt.Exec()
-			}
-			cols := make([]data.Column, ncols)
-			for i := range ncols {
-				cols[i] = data.Column{
-					Name: stmt.ColumnName(i),
-					Type: stmt.ColumnDeclType(i),
-				}
-			}
-			res = data.NewStaticSource(cols)
-			for stmt.Step() {
-				for i := range ncols {
-					switch stmt.ColumnType(i) {
-					case sqlite3.NULL:
-						res.AppendCell(nil, data.KindNull)
-					case sqlite3.INTEGER:
-						res.AppendCell(stmt.ColumnRawText(i), data.KindInteger)
-					case sqlite3.FLOAT:
-						res.AppendCell(stmt.ColumnRawText(i), data.KindReal)
-					case sqlite3.TEXT:
-						v := stmt.ColumnRawText(i)
-						if len(v) > data.PreviewBytes {
-							v = v[:data.PreviewBytes]
-						}
-						res.AppendCell(v, data.KindText)
-					case sqlite3.BLOB:
-						msg := "BLOB " + data.FormatSize(int64(len(stmt.ColumnRawBlob(i))))
-						res.AppendCell([]byte(msg), data.KindBlob)
-					}
-				}
-				rowsRead++
-				if rowsRead >= rowCap {
-					break
-				}
-			}
-			return stmt.Err()
-		})
-		cancel()
-
-		u.mu.Lock()
-		u.sqlRunning = false
-		u.sqlCancel = nil
-		if err != nil {
-			u.sqlStatus = fmt.Sprintf("Error: %v", err)
-		} else if res != nil {
-			suffix := ""
-			if rowsRead >= rowCap {
-				suffix = fmt.Sprintf(" (capped at %d rows)", rowCap)
-			}
-			u.sqlStatus = fmt.Sprintf("%d rows in %s%s", rowsRead, time.Since(start).Round(time.Microsecond), suffix)
-			u.sqlGrid.SetSource(res)
-		} else {
-			u.sqlStatus = fmt.Sprintf("Statement executed in %s", time.Since(start).Round(time.Microsecond))
-		}
-		u.mu.Unlock()
-		u.win.Invalidate()
-	}()
-}
-
 func (u *uiState) setStatus(msg string) {
 	u.mu.Lock()
 	u.statusMsg = msg
@@ -700,13 +560,32 @@ func (u *uiState) run() error {
 	}
 }
 
+func (u *uiState) toggleTheme() {
+	accent := u.th.Accent
+	if a, ok := win.AccentColor(); ok {
+		accent = a
+	}
+	next := !u.th.Dark
+	u.th.SetDark(next, accent)
+	u.applyWindowStyle()
+
+	u.mu.Lock()
+	if u.session != nil {
+		u.session.ThemeSet = true
+		u.session.DarkTheme = next
+		u.persistSessionLocked()
+	}
+	u.mu.Unlock()
+}
+
 func (u *uiState) layout(gtx layout.Context) layout.Dimensions {
 	theme.Fill(gtx, u.th.Window)
 
 	// Global keyboard shortcuts.
 	for {
 		ev, ok := gtx.Event(
-			key.Filter{Name: "O", Required: key.ModCtrl},
+			key.Filter{Name: "O", Required: key.ModCtrl, Optional: key.ModShift},
+			key.Filter{Name: "N", Required: key.ModCtrl},
 			key.Filter{Name: "B", Required: key.ModCtrl},
 			key.Filter{Name: "I", Required: key.ModCtrl},
 			key.Filter{Name: "S", Required: key.ModCtrl},
@@ -727,7 +606,9 @@ func (u *uiState) layout(gtx layout.Context) layout.Dimensions {
 		}
 		switch ke.Name {
 		case "O":
-			u.openDialog()
+			u.openDialog(ke.Modifiers.Contain(key.ModShift))
+		case "N":
+			u.newDatabaseDialog()
 		case "B":
 			u.leftSplit.Collapsed = !u.leftSplit.Collapsed
 		case "I":
@@ -787,6 +668,8 @@ func (u *uiState) layout(gtx layout.Context) layout.Dimensions {
 								return u.layoutSQLView(gtx)
 							case tabStructure:
 								return u.layoutStructureView(gtx)
+							case tabTools:
+								return u.layoutToolsView(gtx)
 							case tabReview:
 								return u.layoutReviewView(gtx)
 							default:
@@ -817,7 +700,7 @@ func (u *uiState) layoutToolbar(gtx layout.Context) layout.Dimensions {
 	theme.FillRect(gtx, clip.Rect{Max: image.Pt(w, h)}, u.th.Chrome)
 
 	if clicked(&u.btnOpen, gtx) {
-		u.openDialog()
+		u.openDialog(false)
 	}
 	if clicked(&u.btnDemo, gtx) {
 		u.loadDemo100M()
@@ -831,6 +714,10 @@ func (u *uiState) layoutToolbar(gtx layout.Context) layout.Dimensions {
 	if clicked(&u.btnTabStructure, gtx) {
 		u.activeTab = tabStructure
 	}
+	if clicked(&u.btnTabTools, gtx) {
+		u.activeTab = tabTools
+		u.refreshToolsInfo()
+	}
 	if clicked(&u.btnTabReview, gtx) {
 		u.activeTab = tabReview
 	}
@@ -841,31 +728,27 @@ func (u *uiState) layoutToolbar(gtx layout.Context) layout.Dimensions {
 		u.rightSplit.Collapsed = !u.rightSplit.Collapsed
 	}
 	if clicked(&u.btnTheme, gtx) {
-		accent := u.th.Accent
-		if a, ok := win.AccentColor(); ok {
-			accent = a
-		}
-		u.th.SetDark(!u.th.Dark, accent)
-		u.applyWindowStyle()
+		u.toggleTheme()
 	}
 
 	x := gtx.Dp(10)
 	x += u.drawPillButton(gtx, x, h, "Open DB…", false, false, &u.btnOpen) + gtx.Dp(6)
-	x += u.drawPillButton(gtx, x, h, "100M Demo", u.activeTable == "synthetic_100M", false, &u.btnDemo) + gtx.Dp(14)
+	x += u.drawPillButton(gtx, x, h, "100M Demo", u.activeTable == "synthetic_100M", false, &u.btnDemo) + gtx.Dp(12)
 
 	theme.FillRect(gtx, clip.Rect{Min: image.Pt(x, gtx.Dp(10)), Max: image.Pt(x+1, h-gtx.Dp(10))}, u.th.Border)
-	x += gtx.Dp(14)
+	x += gtx.Dp(12)
 
 	x += u.drawPillButton(gtx, x, h, "Browse Data", u.activeTab == tabBrowse, true, &u.btnTabBrowse) + gtx.Dp(6)
 	x += u.drawPillButton(gtx, x, h, "Execute SQL", u.activeTab == tabSQL, true, &u.btnTabSQL) + gtx.Dp(6)
 	x += u.drawPillButton(gtx, x, h, "Structure", u.activeTab == tabStructure, true, &u.btnTabStructure) + gtx.Dp(6)
+	x += u.drawPillButton(gtx, x, h, "DB Tools", u.activeTab == tabTools, true, &u.btnTabTools) + gtx.Dp(6)
 
 	u.mu.Lock()
 	src := u.tableSrc
 	u.mu.Unlock()
 	if src != nil && src.Editable() {
 		if n := src.Changes().Count(); n > 0 {
-			lbl := fmt.Sprintf("Review Changes (%d)", n)
+			lbl := fmt.Sprintf("Review (%d)", n)
 			x += u.drawPillButton(gtx, x, h, lbl, u.activeTab == tabReview, true, &u.btnTabReview) + gtx.Dp(6)
 		}
 	}
@@ -879,10 +762,10 @@ func (u *uiState) layoutToolbar(gtx layout.Context) layout.Dimensions {
 	rx -= gtx.Dp(68)
 	u.drawPillButton(gtx, rx, h, themeLabel, false, false, &u.btnTheme)
 
-	rx -= gtx.Dp(96)
+	rx -= gtx.Dp(94)
 	u.drawPillButton(gtx, rx, h, "Inspector", !u.rightSplit.Collapsed, false, &u.btnInspector)
 
-	rx -= gtx.Dp(86)
+	rx -= gtx.Dp(82)
 	u.drawPillButton(gtx, rx, h, "Sidebar", !u.leftSplit.Collapsed, false, &u.btnSidebar)
 
 	theme.FillRect(gtx, clip.Rect{Min: image.Pt(0, h-1), Max: image.Pt(w, h)}, u.th.Border)
@@ -892,7 +775,12 @@ func (u *uiState) layoutToolbar(gtx layout.Context) layout.Dimensions {
 func (u *uiState) layoutBrowseView(gtx layout.Context) layout.Dimensions {
 	u.mu.Lock()
 	src := u.tableSrc
+	db := u.db
+	tbl := u.activeTable
 	u.mu.Unlock()
+	if db == nil && tbl == "" {
+		return u.layoutWelcomeView(gtx)
+	}
 	if src == nil {
 		return u.browseGrid.Layout(gtx, u.th)
 	}
@@ -951,10 +839,16 @@ func (u *uiState) layoutBrowseBar(gtx layout.Context, src *data.TableSource) lay
 	if clicked(&u.btnRedo, gtx) && src.Editable() {
 		src.Changes().Redo()
 	}
+	if clicked(&u.btnBrowseCSV, gtx) {
+		u.exportBrowseTable(false)
+	}
+	if clicked(&u.btnBrowseJSON, gtx) {
+		u.exportBrowseTable(true)
+	}
 
 	x := gtx.Dp(8)
 	// Filter input box.
-	fltW := min(gtx.Dp(280), max(gtx.Dp(120), w/3))
+	fltW := min(gtx.Dp(260), max(gtx.Dp(110), w/3))
 	u.drawInputBox(gtx, x, h, fltW, &u.filterEdit, "Filter rows (search or WHERE expr)…")
 	x += fltW + gtx.Dp(6)
 	x += u.drawPillButton(gtx, x, h, "Filter", src.Filter() != "", false, &u.btnApplyFilter) + gtx.Dp(4)
@@ -963,9 +857,9 @@ func (u *uiState) layoutBrowseBar(gtx layout.Context, src *data.TableSource) lay
 	}
 
 	// Go to row input box.
-	gotoW := gtx.Dp(105)
-	u.drawInputBox(gtx, x, h, gotoW, &u.gotoEdit, "Go to row #…")
-	x += gotoW + gtx.Dp(10)
+	gotoW := gtx.Dp(96)
+	u.drawInputBox(gtx, x, h, gotoW, &u.gotoEdit, "Row #…")
+	x += gotoW + gtx.Dp(8)
 
 	if src.Editable() {
 		x += u.drawPillButton(gtx, x, h, "+ Row", false, false, &u.btnAddRow) + gtx.Dp(6)
@@ -973,6 +867,17 @@ func (u *uiState) layoutBrowseBar(gtx layout.Context, src *data.TableSource) lay
 			x += u.drawPillButton(gtx, x, h, "Undo", false, false, &u.btnUndo) + gtx.Dp(4)
 			x += u.drawPillButton(gtx, x, h, "Redo", false, false, &u.btnRedo) + gtx.Dp(6)
 		}
+	}
+
+	x += u.drawPillButton(gtx, x, h, "CSV", false, false, &u.btnBrowseCSV) + gtx.Dp(4)
+	x += u.drawPillButton(gtx, x, h, "JSON", false, false, &u.btnBrowseJSON) + gtx.Dp(8)
+
+	if err := src.Err(); err != nil && x < w-gtx.Dp(40) {
+		off := op.Offset(image.Pt(x, gtx.Dp(10))).Push(gtx.Ops)
+		cg := gtx
+		cg.Constraints.Max.X = max(0, w-x-gtx.Dp(10))
+		u.th.LabelFont(cg, font.Font{Typeface: u.th.Mono}, u.th.Small, u.th.Danger, text.Start, err.Error())
+		off.Pop()
 	}
 
 	theme.FillRect(gtx, clip.Rect{Min: image.Pt(0, h-1), Max: image.Pt(w, h)}, u.th.Border)
@@ -1061,260 +966,6 @@ func (u *uiState) layoutReviewView(gtx layout.Context) layout.Dimensions {
 	)
 }
 
-func (u *uiState) layoutSQLView(gtx layout.Context) layout.Dimensions {
-	return u.sqlSplit.Layout(gtx, u.th,
-		func(gtx layout.Context) layout.Dimensions {
-			return u.layoutSQLEditorPane(gtx)
-		},
-		func(gtx layout.Context) layout.Dimensions {
-			return u.sqlGrid.Layout(gtx, u.th)
-		},
-	)
-}
-
-func (u *uiState) layoutStructureView(gtx layout.Context) layout.Dimensions {
-	theme.Fill(gtx, u.th.Surface)
-	u.mu.Lock()
-	obj := u.structObj
-	idxInfo := u.structIndex
-	rel := u.structRel
-	schema := u.schema
-	u.mu.Unlock()
-
-	if obj == nil {
-		return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return u.th.Label(gtx, u.th.UISize, u.th.TextSubtle, "Select any table, view, index, or trigger from the sidebar to inspect its structure and DDL.")
-		})
-	}
-
-	targetTable := obj.Name
-	if obj.Table != "" {
-		targetTable = obj.Table
-	}
-	var targetObj *engine.Object
-	if schema != nil && targetTable != "" {
-		targetObj = schema.Find(targetTable)
-	}
-
-	if clicked(&u.btnBrowseTarget, gtx) && targetObj != nil {
-		u.tree.SelectObject(targetObj)
-		u.selectObject(targetObj)
-	}
-	if clicked(&u.btnQueryStruct, gtx) {
-		q := fmt.Sprintf("SELECT * FROM %s LIMIT 500;", engine.QuoteIdent(targetTable))
-		if obj.Type == engine.TypeIndex && idxInfo != nil {
-			var orderCols []string
-			for _, c := range idxInfo.Columns {
-				if !c.Key || c.CID < 0 {
-					continue
-				}
-				dir := ""
-				if c.Desc {
-					dir = " DESC"
-				}
-				orderCols = append(orderCols, engine.QuoteIdent(c.Name)+dir)
-			}
-			if len(orderCols) > 0 {
-				q = fmt.Sprintf("SELECT * FROM %s\nORDER BY %s\nLIMIT 500;", engine.QuoteIdent(targetTable), strings.Join(orderCols, ", "))
-			}
-		}
-		u.sqlEdit.SetText(q)
-		u.activeTab = tabSQL
-	}
-	if clicked(&u.btnCopyDDL, gtx) {
-		ddl := u.ddlEdit.Text()
-		gtx.Execute(clipboard.WriteCmd{
-			Type: "application/text",
-			Data: io.NopCloser(strings.NewReader(ddl)),
-		})
-		u.setStatus("Copied DDL for " + obj.Name + " to clipboard")
-	}
-
-	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			barH := gtx.Dp(40)
-			w := gtx.Constraints.Max.X
-			theme.FillRect(gtx, clip.Rect{Max: image.Pt(w, barH)}, u.th.SurfaceAlt)
-
-			var badgeParts []string
-			badgeParts = append(badgeParts, strings.ToUpper(string(obj.Type))+" · "+obj.Name)
-			if (obj.Type == engine.TypeIndex || obj.Type == engine.TypeTrigger) && obj.Table != "" {
-				badgeParts = append(badgeParts, "on "+obj.Table)
-			}
-			if obj.Type == engine.TypeIndex && idxInfo != nil {
-				if idxInfo.Unique {
-					badgeParts = append(badgeParts, "UNIQUE")
-				}
-				if idxInfo.Partial {
-					badgeParts = append(badgeParts, "PARTIAL")
-				}
-			}
-			if obj.WithoutRowid {
-				badgeParts = append(badgeParts, "WITHOUT ROWID")
-			}
-			if obj.Strict {
-				badgeParts = append(badgeParts, "STRICT")
-			}
-			title := strings.Join(badgeParts, "  ·  ")
-
-			x := gtx.Dp(12)
-			if targetObj != nil && (targetObj.Type == engine.TypeTable || targetObj.Type == engine.TypeView) {
-				lbl := "Browse " + targetObj.Name
-				x += u.drawPillButton(gtx, x, barH, lbl, false, true, &u.btnBrowseTarget) + gtx.Dp(6)
-			}
-			if targetTable != "" {
-				x += u.drawPillButton(gtx, x, barH, "Select in SQL", false, false, &u.btnQueryStruct) + gtx.Dp(6)
-			}
-			x += u.drawPillButton(gtx, x, barH, "Copy DDL", false, false, &u.btnCopyDDL) + gtx.Dp(12)
-
-			off := op.Offset(image.Pt(x, gtx.Dp(11))).Push(gtx.Ops)
-			cg := gtx
-			cg.Constraints.Max.X = max(0, w-x-gtx.Dp(12))
-			u.th.LabelFont(cg, font.Font{Typeface: u.th.UI, Weight: font.SemiBold}, u.th.Small, u.th.Text, text.Start, title)
-			off.Pop()
-
-			theme.FillRect(gtx, clip.Rect{Min: image.Pt(0, barH-1), Max: image.Pt(w, barH)}, u.th.Border)
-			return layout.Dimensions{Size: image.Pt(w, barH)}
-		}),
-		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-			return u.structSplit.Layout(gtx, u.th,
-				func(gtx layout.Context) layout.Dimensions {
-					return u.structGrid.Layout(gtx, u.th)
-				},
-				func(gtx layout.Context) layout.Dimensions {
-					return u.layoutStructureDDLPane(gtx, obj, rel)
-				},
-			)
-		}),
-	)
-}
-
-func (u *uiState) layoutStructureDDLPane(gtx layout.Context, obj *engine.Object, rel []*engine.Object) layout.Dimensions {
-	theme.Fill(gtx, u.th.Surface)
-	for {
-		if _, ok := u.ddlEdit.Update(gtx); !ok {
-			break
-		}
-	}
-	if len(u.structRelClicks) < len(rel) {
-		u.structRelClicks = make([]gesture.Click, len(rel))
-	}
-	for i, r := range rel {
-		if clicked(&u.structRelClicks[i], gtx) {
-			u.tree.SelectObject(r)
-			u.selectObject(r)
-		}
-	}
-
-	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			if len(rel) == 0 {
-				return layout.Dimensions{}
-			}
-			barH := gtx.Dp(34)
-			w := gtx.Constraints.Max.X
-			theme.FillRect(gtx, clip.Rect{Max: image.Pt(w, barH)}, u.th.Chrome)
-			x := gtx.Dp(12)
-			off := op.Offset(image.Pt(x, gtx.Dp(9))).Push(gtx.Ops)
-			u.th.Label(gtx, u.th.Small, u.th.TextSubtle, "Indexes & Triggers:")
-			off.Pop()
-			x += gtx.Dp(124)
-			for i, r := range rel {
-				if x > w-gtx.Dp(90) {
-					break
-				}
-				prefix := "idx"
-				if r.Type == engine.TypeTrigger {
-					prefix = "trg"
-				}
-				active := obj != nil && r.Type == obj.Type && r.Name == obj.Name
-				x += u.drawPillButton(gtx, x, barH, prefix+": "+r.Name, active, false, &u.structRelClicks[i]) + gtx.Dp(6)
-			}
-			theme.FillRect(gtx, clip.Rect{Min: image.Pt(0, barH-1), Max: image.Pt(w, barH)}, u.th.BorderSubtle)
-			return layout.Dimensions{Size: image.Pt(w, barH)}
-		}),
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			h := gtx.Dp(26)
-			w := gtx.Constraints.Max.X
-			theme.FillRect(gtx, clip.Rect{Max: image.Pt(w, h)}, u.th.SurfaceAlt)
-			off := op.Offset(image.Pt(gtx.Dp(12), gtx.Dp(5))).Push(gtx.Ops)
-			u.th.LabelFont(gtx, font.Font{Typeface: u.th.UI, Weight: font.SemiBold}, u.th.Small, u.th.TextMuted, text.Start, "DDL Definition (select text or click Copy DDL)")
-			off.Pop()
-			theme.FillRect(gtx, clip.Rect{Min: image.Pt(0, h-1), Max: image.Pt(w, h)}, u.th.BorderSubtle)
-			return layout.Dimensions{Size: image.Pt(w, h)}
-		}),
-		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-			return layout.Inset{Top: 10, Bottom: 10, Left: 14, Right: 14}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				m := op.Record(gtx.Ops)
-				paint.ColorOp{Color: u.th.Text}.Add(gtx.Ops)
-				textMat := m.Stop()
-				ms := op.Record(gtx.Ops)
-				paint.ColorOp{Color: u.th.Selected}.Add(gtx.Ops)
-				selMat := ms.Stop()
-				return u.ddlEdit.Layout(gtx, u.th.Shaper, font.Font{Typeface: u.th.Mono}, u.th.Code, textMat, selMat)
-			})
-		}),
-	)
-}
-
-func (u *uiState) layoutSQLEditorPane(gtx layout.Context) layout.Dimensions {
-	theme.Fill(gtx, u.th.Surface)
-	barH := gtx.Dp(34)
-	w := gtx.Constraints.Max.X
-
-	for {
-		if _, ok := u.sqlEdit.Update(gtx); !ok {
-			break
-		}
-	}
-	if clicked(&u.btnRunSQL, gtx) {
-		u.runSQL()
-	}
-	if clicked(&u.btnCancelSQL, gtx) {
-		u.mu.Lock()
-		if u.sqlCancel != nil {
-			u.sqlCancel()
-		}
-		u.mu.Unlock()
-	}
-
-	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			theme.FillRect(gtx, clip.Rect{Max: image.Pt(w, barH)}, u.th.SurfaceAlt)
-			x := gtx.Dp(10)
-			u.mu.Lock()
-			running := u.sqlRunning
-			status := u.sqlStatus
-			u.mu.Unlock()
-
-			x += u.drawPillButton(gtx, x, barH, "▶ Run (Ctrl+Enter)", true, true, &u.btnRunSQL) + gtx.Dp(6)
-			if running {
-				x += u.drawPillButton(gtx, x, barH, "■ Cancel", false, false, &u.btnCancelSQL) + gtx.Dp(10)
-			}
-			if status != "" {
-				off := op.Offset(image.Pt(x+gtx.Dp(6), gtx.Dp(8))).Push(gtx.Ops)
-				u.th.LabelFont(gtx, font.Font{Typeface: u.th.Mono}, u.th.Small, u.th.TextMuted, text.Start, status)
-				off.Pop()
-			}
-			theme.FillRect(gtx, clip.Rect{Min: image.Pt(0, barH-1), Max: image.Pt(w, barH)}, u.th.BorderSubtle)
-			return layout.Dimensions{Size: image.Pt(w, barH)}
-		}),
-		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-			return layout.Inset{Top: 8, Bottom: 8, Left: 12, Right: 12}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				m := op.Record(gtx.Ops)
-				paint.ColorOp{Color: u.th.Text}.Add(gtx.Ops)
-				textMat := m.Stop()
-
-				ms := op.Record(gtx.Ops)
-				paint.ColorOp{Color: u.th.Selected}.Add(gtx.Ops)
-				selMat := ms.Stop()
-
-				return u.sqlEdit.Layout(gtx, u.th.Shaper, font.Font{Typeface: u.th.Mono}, u.th.Code, textMat, selMat)
-			})
-		}),
-	)
-}
-
 type paletteItem struct {
 	label string
 	hint  string
@@ -1323,30 +974,41 @@ type paletteItem struct {
 
 func (u *uiState) layoutCommandPalette(gtx layout.Context) {
 	size := gtx.Constraints.Max
-	// Dim backdrop.
 	theme.FillRect(gtx, clip.Rect{Max: size}, u.th.Hover)
 
 	u.mu.Lock()
 	schema := u.schema
+	var recent []string
+	if u.session != nil {
+		recent = append(recent, u.session.RecentFiles...)
+	}
 	u.mu.Unlock()
 
 	items := []paletteItem{
-		{"Open Database…", "Ctrl+O", u.openDialog},
+		{"Open Database…", "Ctrl+O", func() { u.openDialog(false) }},
+		{"Open Database (Read-Only)…", "Ctrl+Shift+O", func() { u.openDialog(true) }},
+		{"Create New Database…", "Ctrl+N", u.newDatabaseDialog},
+		{"Execute .sql Script File (Streamed)…", "", u.runSQLFileDialog},
+		{"Export Current Table as CSV…", "", func() { u.exportBrowseTable(false) }},
+		{"Export Current Table as JSON…", "", func() { u.exportBrowseTable(true) }},
+		{"VACUUM INTO Compact Copy…", "", u.vacuumIntoDialog},
 		{"Load 100,000,000-Row Virtualized Demo", "", u.loadDemo100M},
 		{"Switch to Browse Data Tab", "", func() { u.activeTab = tabBrowse }},
 		{"Switch to Execute SQL Tab", "", func() { u.activeTab = tabSQL }},
 		{"Switch to Structure / DDL Tab", "", func() { u.activeTab = tabStructure }},
+		{"Switch to DB Tools Tab", "", func() { u.activeTab = tabTools; u.refreshToolsInfo() }},
 		{"Review & Commit Staged Changes", "Ctrl+S", func() { u.activeTab = tabReview }},
 		{"Toggle Left Schema Sidebar", "Ctrl+B", func() { u.leftSplit.Collapsed = !u.leftSplit.Collapsed }},
 		{"Toggle Right Cell Inspector", "Ctrl+I", func() { u.rightSplit.Collapsed = !u.rightSplit.Collapsed }},
-		{"Toggle Dark / Light Theme", "", func() {
-			accent := u.th.Accent
-			if a, ok := win.AccentColor(); ok {
-				accent = a
-			}
-			u.th.SetDark(!u.th.Dark, accent)
-			u.applyWindowStyle()
-		}},
+		{"Toggle Dark / Light Theme", "", u.toggleTheme},
+	}
+	for _, p := range recent {
+		path := p
+		items = append(items, paletteItem{
+			label: "Open Recent: " + filepath.Base(path),
+			hint:  filepath.Dir(path),
+			run:   func() { u.openDatabase(path, false) },
+		})
 	}
 	if schema != nil {
 		for _, o := range schema.Objects {
@@ -1369,7 +1031,7 @@ func (u *uiState) layoutCommandPalette(gtx layout.Context) {
 	q := strings.ToLower(strings.TrimSpace(u.paletteEdit.Text()))
 	var filtered []paletteItem
 	for _, it := range items {
-		if q == "" || strings.Contains(strings.ToLower(it.label), q) {
+		if q == "" || strings.Contains(strings.ToLower(it.label), q) || strings.Contains(strings.ToLower(it.hint), q) {
 			filtered = append(filtered, it)
 		}
 	}
@@ -1389,8 +1051,8 @@ func (u *uiState) layoutCommandPalette(gtx layout.Context) {
 		}
 	}
 
-	boxW := min(gtx.Dp(520), size.X-gtx.Dp(40))
-	boxH := min(gtx.Dp(340), size.Y-gtx.Dp(80))
+	boxW := min(gtx.Dp(540), size.X-gtx.Dp(40))
+	boxH := min(gtx.Dp(360), size.Y-gtx.Dp(80))
 	bx := (size.X - boxW) / 2
 	by := gtx.Dp(56)
 	boxRect := image.Rect(bx, by, bx+boxW, by+boxH)
@@ -1408,7 +1070,7 @@ func (u *uiState) layoutCommandPalette(gtx layout.Context) {
 	cg := gtx
 	cg.Constraints = layout.Exact(image.Pt(boxW, boxH))
 
-	u.drawInputBox(cg, gtx.Dp(10), gtx.Dp(42), boxW-gtx.Dp(20), &u.paletteEdit, "Type a command or table name…")
+	u.drawInputBox(cg, gtx.Dp(10), gtx.Dp(42), boxW-gtx.Dp(20), &u.paletteEdit, "Type a command, object, or recent file…")
 
 	listOff := op.Offset(image.Pt(0, gtx.Dp(44))).Push(gtx.Ops)
 	lcg := cg
@@ -1461,7 +1123,11 @@ func (u *uiState) layoutStatusBar(gtx layout.Context) layout.Dimensions {
 
 	var leftParts []string
 	if db != nil {
-		leftParts = append(leftParts, fmt.Sprintf("%s (%s)", filepath.Base(db.Path), data.FormatSize(dbSize)))
+		name := fmt.Sprintf("%s (%s)", filepath.Base(db.Path), data.FormatSize(dbSize))
+		if db.ReadOnly {
+			name += " RO"
+		}
+		leftParts = append(leftParts, name)
 	}
 	if src != nil {
 		cnt, st := src.Count()
@@ -1473,7 +1139,7 @@ func (u *uiState) layoutStatusBar(gtx layout.Context) layout.Dimensions {
 		leftParts = append(leftParts, fmt.Sprintf("cache %s", data.FormatSize(int64(src.CacheBytes()))))
 		if src.Editable() {
 			if n := src.Changes().Count(); n > 0 {
-				leftParts = append(leftParts, fmt.Sprintf("%d staged change(s) (Ctrl+S to review)", n))
+				leftParts = append(leftParts, fmt.Sprintf("%d staged change(s) (Ctrl+S)", n))
 			}
 		}
 	} else if tbl != "" {
@@ -1503,9 +1169,13 @@ func (u *uiState) layoutStatusBar(gtx layout.Context) layout.Dimensions {
 }
 
 func (u *uiState) drawPillButton(gtx layout.Context, x, barH int, label string, active, accent bool, clk *gesture.Click) int {
-	btnW := gtx.Dp(unit.Dp(len(label)*7 + 22))
 	btnH := gtx.Dp(26)
 	y := (barH - btnH) / 2
+	return u.drawPillButtonAt(gtx, x, y, btnH, label, active, accent, clk)
+}
+
+func (u *uiState) drawPillButtonAt(gtx layout.Context, x, y, btnH int, label string, active, accent bool, clk *gesture.Click) int {
+	btnW := gtx.Dp(unit.Dp(utf8.RuneCountInString(label)*7 + 20))
 	r := image.Rect(x, y, x+btnW, y+btnH)
 	rr := clip.RRect{
 		Rect: r,
@@ -1530,7 +1200,8 @@ func (u *uiState) drawPillButton(gtx layout.Context, x, barH int, label string, 
 		paint.FillShape(gtx.Ops, u.th.Border, border)
 	}
 
-	off := op.Offset(image.Pt(x, y+gtx.Dp(4))).Push(gtx.Ops)
+	textOffY := max(2, (btnH-gtx.Dp(18))/2)
+	off := op.Offset(image.Pt(x, y+textOffY)).Push(gtx.Ops)
 	cg := gtx
 	cg.Constraints.Min.X = btnW
 	cg.Constraints.Max.X = btnW

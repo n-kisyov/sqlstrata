@@ -3,12 +3,16 @@ package widgets
 import (
 	"image"
 	"image/color"
+	"io"
 	"math"
 	"strconv"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"gioui.org/font"
 	"gioui.org/gesture"
+	"gioui.org/io/clipboard"
 	"gioui.org/io/event"
 	"gioui.org/io/key"
 	"gioui.org/io/pointer"
@@ -51,12 +55,13 @@ type EditableGridSource interface {
 // DataGrid is a 2D-virtualized table view capable of scrolling hundreds of
 // millions of rows and hundreds of columns at 60+ fps with flat memory usage.
 type DataGrid struct {
-	src        GridSource
-	colWidths  []unit.Dp
-	colResizes []gesture.Drag
-	colClicks  []gesture.Click
-	colOrigins []unit.Dp
-	colPressX  []float32
+	src          GridSource
+	colWidths    []unit.Dp
+	colResizes   []gesture.Drag
+	colClicks    []gesture.Click
+	colOrigins   []unit.Dp
+	colPressX    []float32
+	colLastPress []time.Duration
 
 	// Scroll state: topRow is the index of the first visible row, subY is the
 	// pixel offset within topRow [0, rowH). Keeping topRow in int64 avoids
@@ -86,6 +91,8 @@ type DataGrid struct {
 
 	// OnSelectCell is called when the active cell changes.
 	OnSelectCell func(row int64, col int)
+	// OnCopy is called when the user copies a cell value with Ctrl+C.
+	OnCopy func(val string)
 }
 
 // NewDataGrid creates a ready-to-use DataGrid.
@@ -114,6 +121,7 @@ func (g *DataGrid) SetSource(src GridSource) {
 		g.colClicks = nil
 		g.colOrigins = nil
 		g.colPressX = nil
+		g.colLastPress = nil
 		return
 	}
 	cols := src.Columns()
@@ -122,6 +130,7 @@ func (g *DataGrid) SetSource(src GridSource) {
 	g.colClicks = make([]gesture.Click, len(cols))
 	g.colOrigins = make([]unit.Dp, len(cols))
 	g.colPressX = make([]float32, len(cols))
+	g.colLastPress = make([]time.Duration, len(cols))
 	for i, c := range cols {
 		w := unit.Dp(max(130, min(280, len(c.Name)*10+64)))
 		up := strings.ToUpper(c.Type)
@@ -233,6 +242,13 @@ func (g *DataGrid) Layout(gtx layout.Context, th *theme.Theme) layout.Dimensions
 			case pointer.Press:
 				g.colPressX[i] = ev.Position.X
 				g.colOrigins[i] = g.colWidths[i]
+				if g.colLastPress[i] > 0 && ev.Time-g.colLastPress[i] <= 350*time.Millisecond {
+					g.autoFitCol(i, totalRows)
+					g.colOrigins[i] = g.colWidths[i]
+					g.colLastPress[i] = 0
+				} else {
+					g.colLastPress[i] = ev.Time
+				}
 			case pointer.Drag:
 				delta := unit.Dp((ev.Position.X - g.colPressX[i]) / pxPerDp)
 				g.colWidths[i] = max(48, min(1200, g.colOrigins[i]+delta))
@@ -965,12 +981,29 @@ func (g *DataGrid) handleKeys(gtx layout.Context, totalRows int64, ncols int, pa
 			key.Filter{Focus: &g.keyTag, Name: key.NameF2},
 			key.Filter{Focus: &g.keyTag, Name: key.NameReturn},
 			key.Filter{Focus: &g.keyTag, Name: key.NameEnter},
+			key.Filter{Focus: &g.keyTag, Name: "C", Required: key.ModCtrl},
 		)
 		if !ok {
 			break
 		}
 		ke, ok := ev.(key.Event)
 		if !ok || ke.State != key.Press || totalRows <= 0 || ncols <= 0 {
+			continue
+		}
+		if ke.Name == "C" && ke.Modifiers.Contain(key.ModCtrl) && g.selRow >= 0 && g.selCol >= 0 {
+			txt, kind, _, loaded := g.src.Cell(g.selRow, g.selCol)
+			if loaded {
+				if kind == data.KindNull {
+					txt = "NULL"
+				}
+				gtx.Execute(clipboard.WriteCmd{
+					Type: "application/text",
+					Data: io.NopCloser(strings.NewReader(txt)),
+				})
+				if g.OnCopy != nil {
+					g.OnCopy(txt)
+				}
+			}
 			continue
 		}
 		if (ke.Name == key.NameF2 || ke.Name == key.NameReturn || ke.Name == key.NameEnter) && g.selRow >= 0 && g.selCol >= 0 {
@@ -1014,6 +1047,33 @@ func (g *DataGrid) handleKeys(gtx layout.Context, totalRows int64, ncols int, pa
 		g.ScrollToRow(r, pageRows)
 		g.scrollToCol(gtx, c, bodyW)
 	}
+}
+
+func (g *DataGrid) autoFitCol(col int, totalRows int64) {
+	if g.src == nil || col < 0 || col >= len(g.colWidths) {
+		return
+	}
+	cols := g.src.Columns()
+	maxRunes := utf8.RuneCountInString(cols[col].Name) + 3
+	if cols[col].PK {
+		maxRunes += 5
+	}
+	start := g.topRow
+	end := min(totalRows, start+60)
+	for r := start; r < end; r++ {
+		txt, kind, _, ok := g.src.Cell(r, col)
+		if !ok {
+			continue
+		}
+		if kind == data.KindNull {
+			txt = "NULL"
+		}
+		if n := utf8.RuneCountInString(txt); n > maxRunes {
+			maxRunes = n
+		}
+	}
+	w := unit.Dp(max(72, min(480, maxRunes*8+28)))
+	g.colWidths[col] = w
 }
 
 func withAlpha(c color.NRGBA, a uint8) color.NRGBA {

@@ -65,9 +65,10 @@ type TableSource struct {
 	cacheBytes int
 	budget     int
 	tick       uint64
-	requested  map[int64]struct{}
-	inflight   int64 // page being fetched, -1 if none
-	fetchStop  context.CancelFunc
+	requested   map[int64]struct{}
+	inflight    int64 // page being fetched, -1 if none
+	inflightGen uint64
+	fetchStop   context.CancelFunc
 	countStop  context.CancelFunc
 	visFirst   int64
 	visLast    int64
@@ -246,6 +247,38 @@ func (s *TableSource) Reload() {
 	s.invalidate()
 }
 
+// ExportSQL returns the full SELECT statement matching the table's current
+// filter and sort order (with un-truncated column values) for streaming export.
+func (s *TableSource) ExportSQL() string {
+	s.mu.Lock()
+	filterSQL := s.filterSQL
+	sortCol := s.sortCol
+	sortDesc := s.sortDesc
+	s.mu.Unlock()
+
+	cols := make([]string, len(s.cols))
+	for i, c := range s.cols {
+		cols[i] = engine.QuoteIdent(c.Name)
+	}
+	q := "SELECT " + strings.Join(cols, ", ") + " FROM " + s.from
+	if filterSQL != "" {
+		q += " WHERE (" + filterSQL + ")"
+	}
+	if sortCol >= 0 && sortCol < len(s.cols) {
+		dir := "ASC"
+		if sortDesc {
+			dir = "DESC"
+		}
+		q += " ORDER BY " + engine.QuoteIdent(s.cols[sortCol].Name) + " " + dir
+		if s.byRowid {
+			q += ", rowid " + dir
+		}
+	} else if s.byRowid {
+		q += " ORDER BY rowid"
+	}
+	return q
+}
+
 func (s *TableSource) resetPagesLocked(resetCount bool) uint64 {
 	s.gen++
 	s.pages = map[int64]*page{}
@@ -254,7 +287,9 @@ func (s *TableSource) resetPagesLocked(resetCount bool) uint64 {
 	s.err = nil
 	if s.fetchStop != nil {
 		s.fetchStop()
+		s.fetchStop = nil
 	}
+	s.inflight = -1
 	if resetCount {
 		s.countState = CountUnknown
 		s.anchors = nil
@@ -566,7 +601,7 @@ func (s *TableSource) requestLocked(p int64) {
 	if s.countState == CountExact && p*PageRows >= s.count {
 		return
 	}
-	if _, ok := s.pages[p]; ok || p == s.inflight {
+	if _, ok := s.pages[p]; ok || (p == s.inflight && s.inflightGen == s.gen) {
 		return
 	}
 	if _, ok := s.requested[p]; ok {
@@ -598,6 +633,7 @@ func (s *TableSource) next() (int64, uint64, bool) {
 	}
 	delete(s.requested, best)
 	s.inflight = best
+	s.inflightGen = s.gen
 	return best, s.gen, true
 }
 
@@ -615,6 +651,11 @@ func (s *TableSource) fetchLoop() {
 			}
 			ctx, stop := context.WithCancel(s.ctx)
 			s.mu.Lock()
+			if gen != s.gen {
+				stop()
+				s.mu.Unlock()
+				continue
+			}
 			s.fetchStop = stop
 			plan := s.planLocked(p)
 			s.mu.Unlock()
@@ -628,8 +669,10 @@ func (s *TableSource) fetchLoop() {
 			stop()
 
 			s.mu.Lock()
-			s.inflight = -1
-			s.fetchStop = nil
+			if s.inflight == p && s.inflightGen == gen {
+				s.inflight = -1
+				s.fetchStop = nil
+			}
 			if gen != s.gen {
 				s.mu.Unlock()
 				continue
