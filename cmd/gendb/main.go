@@ -5,11 +5,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"math/rand/v2"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -33,7 +35,9 @@ func main() {
 		_ = os.Remove(*out + suffix)
 	}
 
-	db, err := sqlite3.Open(*out)
+	// Each ncruces connection has a hard memory cap (256 MB by default);
+	// raise it so the large page cache below fits.
+	db, err := sqlite3.OpenContext(sqlite3.WithMaxMemory(context.Background(), 1<<30), *out)
 	if err != nil {
 		log.Fatal(err)
 	}
