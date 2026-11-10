@@ -26,9 +26,10 @@ type Splitter struct {
 	SecondFixed bool
 	Collapsed   bool
 
-	drag   gesture.Drag
-	origin unit.Dp
-	active bool
+	drag       gesture.Drag
+	pressPos   float32
+	originSize unit.Dp
+	active     bool
 }
 
 // Layout draws first and second separated by the draggable divider.
@@ -51,6 +52,11 @@ func (s *Splitter) Layout(gtx layout.Context, th *theme.Theme, first, second lay
 		s.Size = s.Min
 	}
 
+	pxPerDp := gtx.Metric.PxPerDp
+	if pxPerDp <= 0 {
+		pxPerDp = 1
+	}
+
 	// Process drag events on the divider handle.
 	for {
 		ev, ok := s.drag.Update(gtx.Metric, gtx.Source, gesture.Axis(s.Axis))
@@ -60,23 +66,24 @@ func (s *Splitter) Layout(gtx layout.Context, th *theme.Theme, first, second lay
 		switch ev.Kind {
 		case pointer.Press:
 			s.active = true
+			s.originSize = s.Size
 			if s.Axis == layout.Horizontal {
-				s.origin = unit.Dp(ev.Position.X) / unit.Dp(gtx.Metric.PxPerDp)
+				s.pressPos = ev.Position.X
 			} else {
-				s.origin = unit.Dp(ev.Position.Y) / unit.Dp(gtx.Metric.PxPerDp)
+				s.pressPos = ev.Position.Y
 			}
 		case pointer.Drag:
-			var cur unit.Dp
+			var cur float32
 			if s.Axis == layout.Horizontal {
-				cur = unit.Dp(ev.Position.X) / unit.Dp(gtx.Metric.PxPerDp)
+				cur = ev.Position.X
 			} else {
-				cur = unit.Dp(ev.Position.Y) / unit.Dp(gtx.Metric.PxPerDp)
+				cur = ev.Position.Y
 			}
-			delta := cur - s.origin
+			delta := unit.Dp((cur - s.pressPos) / pxPerDp)
 			if s.SecondFixed {
-				s.Size -= delta
+				s.Size = s.originSize - delta
 			} else {
-				s.Size += delta
+				s.Size = s.originSize + delta
 			}
 			if s.Size < s.Min {
 				s.Size = s.Min

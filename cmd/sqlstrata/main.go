@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"image"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"gioui.org/app"
 	"gioui.org/font"
 	"gioui.org/gesture"
+	"gioui.org/io/clipboard"
 	"gioui.org/io/key"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
@@ -66,6 +68,7 @@ type viewTab uint8
 const (
 	tabBrowse viewTab = iota
 	tabSQL
+	tabStructure
 	tabReview
 )
 
@@ -74,32 +77,42 @@ type uiState struct {
 	hwnd uintptr
 	th   *theme.Theme
 
-	leftSplit  widgets.Splitter
-	rightSplit widgets.Splitter
-	sqlSplit   widgets.Splitter
+	leftSplit   widgets.Splitter
+	rightSplit  widgets.Splitter
+	sqlSplit    widgets.Splitter
+	structSplit widgets.Splitter
 
 	tree       *widgets.TreeView
 	browseGrid *widgets.DataGrid
 	sqlGrid    *widgets.DataGrid
+	structGrid *widgets.DataGrid
 	inspector  *widgets.Inspector
 
 	activeTab  viewTab
 	sqlEdit    widget.Editor
+	ddlEdit    widget.Editor
 	filterEdit widget.Editor
 	gotoEdit   widget.Editor
 	reviewList layout.List
 
 	// Top bar buttons.
-	btnOpen      gesture.Click
-	btnDemo      gesture.Click
-	btnTabBrowse gesture.Click
-	btnTabSQL    gesture.Click
-	btnTabReview gesture.Click
-	btnRunSQL    gesture.Click
-	btnCancelSQL gesture.Click
-	btnSidebar   gesture.Click
-	btnInspector gesture.Click
-	btnTheme     gesture.Click
+	btnOpen         gesture.Click
+	btnDemo         gesture.Click
+	btnTabBrowse    gesture.Click
+	btnTabSQL       gesture.Click
+	btnTabStructure gesture.Click
+	btnTabReview    gesture.Click
+	btnRunSQL       gesture.Click
+	btnCancelSQL    gesture.Click
+	btnSidebar      gesture.Click
+	btnInspector    gesture.Click
+	btnTheme        gesture.Click
+
+	// Structure view buttons.
+	btnBrowseTarget gesture.Click
+	btnQueryStruct  gesture.Click
+	btnCopyDDL      gesture.Click
+	structRelClicks []gesture.Click
 
 	// Browse sub-toolbar buttons.
 	btnApplyFilter gesture.Click
@@ -123,6 +136,9 @@ type uiState struct {
 	schema      *engine.Schema
 	tableSrc    *data.TableSource
 	activeTable string
+	structObj   *engine.Object
+	structIndex *engine.IndexInfo
+	structRel   []*engine.Object
 	statusMsg   string
 	sqlRunning  bool
 	sqlCancel   context.CancelFunc
@@ -137,14 +153,17 @@ func newUI(w *app.Window) *uiState {
 		leftSplit:   widgets.Splitter{Axis: layout.Horizontal, Size: 250, Min: 170, Max: 520},
 		rightSplit:  widgets.Splitter{Axis: layout.Horizontal, Size: 320, Min: 220, Max: 560, SecondFixed: true},
 		sqlSplit:    widgets.Splitter{Axis: layout.Vertical, Size: 180, Min: 90, Max: 520},
+		structSplit: widgets.Splitter{Axis: layout.Vertical, Size: 230, Min: 100, Max: 520},
 		tree:        widgets.NewTreeView(),
 		browseGrid:  widgets.NewDataGrid(),
 		sqlGrid:     widgets.NewDataGrid(),
+		structGrid:  widgets.NewDataGrid(),
 		inspector:   widgets.NewInspector(),
 		reviewList:  layout.List{Axis: layout.Vertical},
 		paletteList: layout.List{Axis: layout.Vertical},
 		statusMsg:   "Ready · Open a SQLite file (Ctrl+O) or try the 100M-row Demo",
 	}
+	u.ddlEdit.ReadOnly = true
 	u.filterEdit.SingleLine = true
 	u.filterEdit.Submit = true
 	u.gotoEdit.SingleLine = true
@@ -282,22 +301,43 @@ func (u *uiState) openDatabase(path string) {
 		u.win.Option(app.Title("SQLStrata — " + filepath.Base(path)))
 
 		if tables := schema.ByType(engine.TypeTable); len(tables) > 0 {
-			u.tree.Select(tables[0].Name)
+			u.tree.SelectObject(tables[0])
 			u.selectObject(tables[0])
+		} else if len(schema.Objects) > 0 {
+			u.tree.SelectObject(schema.Objects[0])
+			u.selectObject(schema.Objects[0])
 		}
 		u.win.Invalidate()
 	}()
 }
 
 func (u *uiState) selectObject(obj *engine.Object) {
+	if obj == nil {
+		return
+	}
 	u.mu.Lock()
 	db := u.db
 	oldSrc := u.tableSrc
-	u.activeTable = obj.Name
 	u.mu.Unlock()
 	if db == nil {
 		return
 	}
+
+	u.loadStructure(obj)
+
+	if obj.Type == engine.TypeIndex || obj.Type == engine.TypeTrigger {
+		u.mu.Lock()
+		u.activeTab = tabStructure
+		if obj.Table != "" {
+			u.statusMsg = fmt.Sprintf("%s %s on %s", strings.ToUpper(string(obj.Type)), obj.Name, obj.Table)
+		} else {
+			u.statusMsg = fmt.Sprintf("%s %s", strings.ToUpper(string(obj.Type)), obj.Name)
+		}
+		u.mu.Unlock()
+		u.win.Invalidate()
+		return
+	}
+
 	if oldSrc != nil {
 		oldSrc.Close()
 	}
@@ -306,14 +346,170 @@ func (u *uiState) selectObject(obj *engine.Object) {
 	})
 	u.mu.Lock()
 	u.tableSrc = src
+	u.activeTable = obj.Name
+	u.activeTab = tabBrowse
 	u.mu.Unlock()
 
 	u.filterEdit.SetText("")
 	u.gotoEdit.SetText("")
 	u.browseGrid.SetSource(src)
 	u.inspector.Clear()
-	u.activeTab = tabBrowse
 	u.win.Invalidate()
+}
+
+func (u *uiState) loadStructure(obj *engine.Object) {
+	u.mu.Lock()
+	db := u.db
+	schema := u.schema
+	u.structObj = obj
+	u.structIndex = nil
+	tableName := obj.Name
+	if obj.Table != "" {
+		tableName = obj.Table
+	}
+	var rel []*engine.Object
+	if schema != nil && tableName != "" {
+		rel = append(rel, schema.Related(tableName, engine.TypeIndex)...)
+		rel = append(rel, schema.Related(tableName, engine.TypeTrigger)...)
+	}
+	u.structRel = rel
+	u.mu.Unlock()
+
+	ddl := strings.TrimSpace(obj.SQL)
+	if ddl != "" && !strings.HasSuffix(ddl, ";") {
+		ddl += ";"
+	}
+	if ddl == "" {
+		ddl = "-- (Internal or auto-generated SQLite schema object)"
+	}
+	u.ddlEdit.SetText(ddl)
+
+	switch obj.Type {
+	case engine.TypeTable, engine.TypeView:
+		u.structGrid.SetSource(buildTableStructSource(obj))
+	case engine.TypeTrigger:
+		u.structGrid.SetSource(buildTriggerStructSource(obj))
+	case engine.TypeIndex:
+		u.structGrid.SetSource(buildIndexStructSource(obj, nil))
+		if db != nil {
+			db.Fg.Go(context.Background(), func(c *sqlite3.Conn) error {
+				info, err := engine.LoadIndexInfo(c, obj)
+				if err != nil {
+					return err
+				}
+				u.mu.Lock()
+				stillSelected := u.structObj == obj
+				if stillSelected {
+					u.structIndex = info
+				}
+				u.mu.Unlock()
+				if stillSelected {
+					u.structGrid.SetSource(buildIndexStructSource(obj, info))
+					u.win.Invalidate()
+				}
+				return nil
+			}, nil)
+		}
+	}
+}
+
+func buildTableStructSource(obj *engine.Object) *data.StaticSource {
+	src := data.NewStaticSource([]data.Column{
+		{Name: "cid", Type: "INTEGER", PK: true},
+		{Name: "column", Type: "TEXT"},
+		{Name: "type", Type: "TEXT"},
+		{Name: "nullable", Type: "TEXT"},
+		{Name: "default", Type: "TEXT"},
+		{Name: "pk", Type: "INTEGER"},
+		{Name: "flags", Type: "TEXT"},
+	})
+	for i, c := range obj.Columns {
+		src.AppendCell([]byte(strconv.Itoa(i)), data.KindInteger)
+		src.AppendCell([]byte(c.Name), data.KindText)
+		if c.Type != "" {
+			src.AppendCell([]byte(c.Type), data.KindText)
+		} else {
+			src.AppendCell(nil, data.KindNull)
+		}
+		if c.NotNull {
+			src.AppendCell([]byte("NOT NULL"), data.KindText)
+		} else {
+			src.AppendCell([]byte("NULL"), data.KindText)
+		}
+		if c.HasDflt {
+			src.AppendCell([]byte(c.Default), data.KindText)
+		} else {
+			src.AppendCell(nil, data.KindNull)
+		}
+		if c.PK > 0 {
+			src.AppendCell([]byte(strconv.Itoa(c.PK)), data.KindInteger)
+		} else {
+			src.AppendCell(nil, data.KindNull)
+		}
+		var flags []string
+		if obj.RowidAlias != "" && c.Name == obj.RowidAlias {
+			flags = append(flags, "ROWID ALIAS")
+		}
+		switch c.Hidden {
+		case 2:
+			flags = append(flags, "GENERATED VIRTUAL")
+		case 3:
+			flags = append(flags, "GENERATED STORED")
+		}
+		if len(flags) > 0 {
+			src.AppendCell([]byte(strings.Join(flags, ", ")), data.KindText)
+		} else {
+			src.AppendCell(nil, data.KindNull)
+		}
+	}
+	return src
+}
+
+func buildIndexStructSource(obj *engine.Object, info *engine.IndexInfo) *data.StaticSource {
+	src := data.NewStaticSource([]data.Column{
+		{Name: "seqno", Type: "INTEGER", PK: true},
+		{Name: "column", Type: "TEXT"},
+		{Name: "order", Type: "TEXT"},
+		{Name: "collation", Type: "TEXT"},
+		{Name: "role", Type: "TEXT"},
+	})
+	if info == nil {
+		return src
+	}
+	for _, c := range info.Columns {
+		src.AppendCell([]byte(strconv.Itoa(c.Seqno)), data.KindInteger)
+		src.AppendCell([]byte(c.Name), data.KindText)
+		if c.Desc {
+			src.AppendCell([]byte("DESC"), data.KindText)
+		} else {
+			src.AppendCell([]byte("ASC"), data.KindText)
+		}
+		if c.Coll != "" {
+			src.AppendCell([]byte(c.Coll), data.KindText)
+		} else {
+			src.AppendCell(nil, data.KindNull)
+		}
+		if c.Key {
+			src.AppendCell([]byte("Index Key"), data.KindText)
+		} else {
+			src.AppendCell([]byte("Auxiliary (locator)"), data.KindText)
+		}
+	}
+	return src
+}
+
+func buildTriggerStructSource(obj *engine.Object) *data.StaticSource {
+	src := data.NewStaticSource([]data.Column{
+		{Name: "property", Type: "TEXT"},
+		{Name: "value", Type: "TEXT"},
+	})
+	src.AppendCell([]byte("Object Type"), data.KindText)
+	src.AppendCell([]byte("Trigger"), data.KindText)
+	src.AppendCell([]byte("Name"), data.KindText)
+	src.AppendCell([]byte(obj.Name), data.KindText)
+	src.AppendCell([]byte("Target Table"), data.KindText)
+	src.AppendCell([]byte(obj.Table), data.KindText)
+	return src
 }
 
 func (u *uiState) loadDemo100M() {
@@ -589,6 +785,8 @@ func (u *uiState) layout(gtx layout.Context) layout.Dimensions {
 							switch u.activeTab {
 							case tabSQL:
 								return u.layoutSQLView(gtx)
+							case tabStructure:
+								return u.layoutStructureView(gtx)
 							case tabReview:
 								return u.layoutReviewView(gtx)
 							default:
@@ -630,6 +828,9 @@ func (u *uiState) layoutToolbar(gtx layout.Context) layout.Dimensions {
 	if clicked(&u.btnTabSQL, gtx) {
 		u.activeTab = tabSQL
 	}
+	if clicked(&u.btnTabStructure, gtx) {
+		u.activeTab = tabStructure
+	}
 	if clicked(&u.btnTabReview, gtx) {
 		u.activeTab = tabReview
 	}
@@ -657,6 +858,7 @@ func (u *uiState) layoutToolbar(gtx layout.Context) layout.Dimensions {
 
 	x += u.drawPillButton(gtx, x, h, "Browse Data", u.activeTab == tabBrowse, true, &u.btnTabBrowse) + gtx.Dp(6)
 	x += u.drawPillButton(gtx, x, h, "Execute SQL", u.activeTab == tabSQL, true, &u.btnTabSQL) + gtx.Dp(6)
+	x += u.drawPillButton(gtx, x, h, "Structure", u.activeTab == tabStructure, true, &u.btnTabStructure) + gtx.Dp(6)
 
 	u.mu.Lock()
 	src := u.tableSrc
@@ -870,6 +1072,191 @@ func (u *uiState) layoutSQLView(gtx layout.Context) layout.Dimensions {
 	)
 }
 
+func (u *uiState) layoutStructureView(gtx layout.Context) layout.Dimensions {
+	theme.Fill(gtx, u.th.Surface)
+	u.mu.Lock()
+	obj := u.structObj
+	idxInfo := u.structIndex
+	rel := u.structRel
+	schema := u.schema
+	u.mu.Unlock()
+
+	if obj == nil {
+		return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return u.th.Label(gtx, u.th.UISize, u.th.TextSubtle, "Select any table, view, index, or trigger from the sidebar to inspect its structure and DDL.")
+		})
+	}
+
+	targetTable := obj.Name
+	if obj.Table != "" {
+		targetTable = obj.Table
+	}
+	var targetObj *engine.Object
+	if schema != nil && targetTable != "" {
+		targetObj = schema.Find(targetTable)
+	}
+
+	if clicked(&u.btnBrowseTarget, gtx) && targetObj != nil {
+		u.tree.SelectObject(targetObj)
+		u.selectObject(targetObj)
+	}
+	if clicked(&u.btnQueryStruct, gtx) {
+		q := fmt.Sprintf("SELECT * FROM %s LIMIT 500;", engine.QuoteIdent(targetTable))
+		if obj.Type == engine.TypeIndex && idxInfo != nil {
+			var orderCols []string
+			for _, c := range idxInfo.Columns {
+				if !c.Key || c.CID < 0 {
+					continue
+				}
+				dir := ""
+				if c.Desc {
+					dir = " DESC"
+				}
+				orderCols = append(orderCols, engine.QuoteIdent(c.Name)+dir)
+			}
+			if len(orderCols) > 0 {
+				q = fmt.Sprintf("SELECT * FROM %s\nORDER BY %s\nLIMIT 500;", engine.QuoteIdent(targetTable), strings.Join(orderCols, ", "))
+			}
+		}
+		u.sqlEdit.SetText(q)
+		u.activeTab = tabSQL
+	}
+	if clicked(&u.btnCopyDDL, gtx) {
+		ddl := u.ddlEdit.Text()
+		gtx.Execute(clipboard.WriteCmd{
+			Type: "application/text",
+			Data: io.NopCloser(strings.NewReader(ddl)),
+		})
+		u.setStatus("Copied DDL for " + obj.Name + " to clipboard")
+	}
+
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			barH := gtx.Dp(40)
+			w := gtx.Constraints.Max.X
+			theme.FillRect(gtx, clip.Rect{Max: image.Pt(w, barH)}, u.th.SurfaceAlt)
+
+			var badgeParts []string
+			badgeParts = append(badgeParts, strings.ToUpper(string(obj.Type))+" · "+obj.Name)
+			if (obj.Type == engine.TypeIndex || obj.Type == engine.TypeTrigger) && obj.Table != "" {
+				badgeParts = append(badgeParts, "on "+obj.Table)
+			}
+			if obj.Type == engine.TypeIndex && idxInfo != nil {
+				if idxInfo.Unique {
+					badgeParts = append(badgeParts, "UNIQUE")
+				}
+				if idxInfo.Partial {
+					badgeParts = append(badgeParts, "PARTIAL")
+				}
+			}
+			if obj.WithoutRowid {
+				badgeParts = append(badgeParts, "WITHOUT ROWID")
+			}
+			if obj.Strict {
+				badgeParts = append(badgeParts, "STRICT")
+			}
+			title := strings.Join(badgeParts, "  ·  ")
+
+			x := gtx.Dp(12)
+			if targetObj != nil && (targetObj.Type == engine.TypeTable || targetObj.Type == engine.TypeView) {
+				lbl := "Browse " + targetObj.Name
+				x += u.drawPillButton(gtx, x, barH, lbl, false, true, &u.btnBrowseTarget) + gtx.Dp(6)
+			}
+			if targetTable != "" {
+				x += u.drawPillButton(gtx, x, barH, "Select in SQL", false, false, &u.btnQueryStruct) + gtx.Dp(6)
+			}
+			x += u.drawPillButton(gtx, x, barH, "Copy DDL", false, false, &u.btnCopyDDL) + gtx.Dp(12)
+
+			off := op.Offset(image.Pt(x, gtx.Dp(11))).Push(gtx.Ops)
+			cg := gtx
+			cg.Constraints.Max.X = max(0, w-x-gtx.Dp(12))
+			u.th.LabelFont(cg, font.Font{Typeface: u.th.UI, Weight: font.SemiBold}, u.th.Small, u.th.Text, text.Start, title)
+			off.Pop()
+
+			theme.FillRect(gtx, clip.Rect{Min: image.Pt(0, barH-1), Max: image.Pt(w, barH)}, u.th.Border)
+			return layout.Dimensions{Size: image.Pt(w, barH)}
+		}),
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			return u.structSplit.Layout(gtx, u.th,
+				func(gtx layout.Context) layout.Dimensions {
+					return u.structGrid.Layout(gtx, u.th)
+				},
+				func(gtx layout.Context) layout.Dimensions {
+					return u.layoutStructureDDLPane(gtx, obj, rel)
+				},
+			)
+		}),
+	)
+}
+
+func (u *uiState) layoutStructureDDLPane(gtx layout.Context, obj *engine.Object, rel []*engine.Object) layout.Dimensions {
+	theme.Fill(gtx, u.th.Surface)
+	for {
+		if _, ok := u.ddlEdit.Update(gtx); !ok {
+			break
+		}
+	}
+	if len(u.structRelClicks) < len(rel) {
+		u.structRelClicks = make([]gesture.Click, len(rel))
+	}
+	for i, r := range rel {
+		if clicked(&u.structRelClicks[i], gtx) {
+			u.tree.SelectObject(r)
+			u.selectObject(r)
+		}
+	}
+
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			if len(rel) == 0 {
+				return layout.Dimensions{}
+			}
+			barH := gtx.Dp(34)
+			w := gtx.Constraints.Max.X
+			theme.FillRect(gtx, clip.Rect{Max: image.Pt(w, barH)}, u.th.Chrome)
+			x := gtx.Dp(12)
+			off := op.Offset(image.Pt(x, gtx.Dp(9))).Push(gtx.Ops)
+			u.th.Label(gtx, u.th.Small, u.th.TextSubtle, "Indexes & Triggers:")
+			off.Pop()
+			x += gtx.Dp(124)
+			for i, r := range rel {
+				if x > w-gtx.Dp(90) {
+					break
+				}
+				prefix := "idx"
+				if r.Type == engine.TypeTrigger {
+					prefix = "trg"
+				}
+				active := obj != nil && r.Type == obj.Type && r.Name == obj.Name
+				x += u.drawPillButton(gtx, x, barH, prefix+": "+r.Name, active, false, &u.structRelClicks[i]) + gtx.Dp(6)
+			}
+			theme.FillRect(gtx, clip.Rect{Min: image.Pt(0, barH-1), Max: image.Pt(w, barH)}, u.th.BorderSubtle)
+			return layout.Dimensions{Size: image.Pt(w, barH)}
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			h := gtx.Dp(26)
+			w := gtx.Constraints.Max.X
+			theme.FillRect(gtx, clip.Rect{Max: image.Pt(w, h)}, u.th.SurfaceAlt)
+			off := op.Offset(image.Pt(gtx.Dp(12), gtx.Dp(5))).Push(gtx.Ops)
+			u.th.LabelFont(gtx, font.Font{Typeface: u.th.UI, Weight: font.SemiBold}, u.th.Small, u.th.TextMuted, text.Start, "DDL Definition (select text or click Copy DDL)")
+			off.Pop()
+			theme.FillRect(gtx, clip.Rect{Min: image.Pt(0, h-1), Max: image.Pt(w, h)}, u.th.BorderSubtle)
+			return layout.Dimensions{Size: image.Pt(w, h)}
+		}),
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{Top: 10, Bottom: 10, Left: 14, Right: 14}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				m := op.Record(gtx.Ops)
+				paint.ColorOp{Color: u.th.Text}.Add(gtx.Ops)
+				textMat := m.Stop()
+				ms := op.Record(gtx.Ops)
+				paint.ColorOp{Color: u.th.Selected}.Add(gtx.Ops)
+				selMat := ms.Stop()
+				return u.ddlEdit.Layout(gtx, u.th.Shaper, font.Font{Typeface: u.th.Mono}, u.th.Code, textMat, selMat)
+			})
+		}),
+	)
+}
+
 func (u *uiState) layoutSQLEditorPane(gtx layout.Context) layout.Dimensions {
 	theme.Fill(gtx, u.th.Surface)
 	barH := gtx.Dp(34)
@@ -948,6 +1335,7 @@ func (u *uiState) layoutCommandPalette(gtx layout.Context) {
 		{"Load 100,000,000-Row Virtualized Demo", "", u.loadDemo100M},
 		{"Switch to Browse Data Tab", "", func() { u.activeTab = tabBrowse }},
 		{"Switch to Execute SQL Tab", "", func() { u.activeTab = tabSQL }},
+		{"Switch to Structure / DDL Tab", "", func() { u.activeTab = tabStructure }},
 		{"Review & Commit Staged Changes", "Ctrl+S", func() { u.activeTab = tabReview }},
 		{"Toggle Left Schema Sidebar", "Ctrl+B", func() { u.leftSplit.Collapsed = !u.leftSplit.Collapsed }},
 		{"Toggle Right Cell Inspector", "Ctrl+I", func() { u.rightSplit.Collapsed = !u.rightSplit.Collapsed }},
@@ -962,17 +1350,19 @@ func (u *uiState) layoutCommandPalette(gtx layout.Context) {
 	}
 	if schema != nil {
 		for _, o := range schema.Objects {
-			if o.Type == engine.TypeTable || o.Type == engine.TypeView {
-				obj := o
-				items = append(items, paletteItem{
-					label: "Browse " + string(obj.Type) + ": " + obj.Name,
-					hint:  string(obj.Type),
-					run: func() {
-						u.tree.Select(obj.Name)
-						u.selectObject(obj)
-					},
-				})
+			obj := o
+			verb := "Inspect"
+			if obj.Type == engine.TypeTable || obj.Type == engine.TypeView {
+				verb = "Browse"
 			}
+			items = append(items, paletteItem{
+				label: verb + " " + string(obj.Type) + ": " + obj.Name,
+				hint:  string(obj.Type),
+				run: func() {
+					u.tree.SelectObject(obj)
+					u.selectObject(obj)
+				},
+			})
 		}
 	}
 

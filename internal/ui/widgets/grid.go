@@ -56,6 +56,7 @@ type DataGrid struct {
 	colResizes []gesture.Drag
 	colClicks  []gesture.Click
 	colOrigins []unit.Dp
+	colPressX  []float32
 
 	// Scroll state: topRow is the index of the first visible row, subY is the
 	// pixel offset within topRow [0, rowH). Keeping topRow in int64 avoids
@@ -64,11 +65,16 @@ type DataGrid struct {
 	subY    int
 	scrollX int
 
-	vScroll   gesture.Scroll
-	hScroll   gesture.Scroll
-	vBarDrag  gesture.Drag
-	bodyClick gesture.Click
-	keyTag    struct{}
+	vScroll        gesture.Scroll
+	hScroll        gesture.Scroll
+	hdrWheel       gesture.Scroll
+	hBarWheel      gesture.Scroll
+	vBarDrag       gesture.Drag
+	vBarGrabOffset float64
+	hBarDrag       gesture.Drag
+	hBarGrabOffset float64
+	bodyClick      gesture.Click
+	keyTag         struct{}
 
 	selRow int64
 	selCol int
@@ -107,6 +113,7 @@ func (g *DataGrid) SetSource(src GridSource) {
 		g.colResizes = nil
 		g.colClicks = nil
 		g.colOrigins = nil
+		g.colPressX = nil
 		return
 	}
 	cols := src.Columns()
@@ -114,6 +121,7 @@ func (g *DataGrid) SetSource(src GridSource) {
 	g.colResizes = make([]gesture.Drag, len(cols))
 	g.colClicks = make([]gesture.Click, len(cols))
 	g.colOrigins = make([]unit.Dp, len(cols))
+	g.colPressX = make([]float32, len(cols))
 	for i, c := range cols {
 		w := unit.Dp(max(130, min(280, len(c.Name)*10+64)))
 		up := strings.ToUpper(c.Type)
@@ -132,6 +140,20 @@ func (g *DataGrid) Source() GridSource { return g.src }
 // SelectedCell returns the selected (row, col), or (-1, -1) if none.
 func (g *DataGrid) SelectedCell() (int64, int) { return g.selRow, g.selCol }
 
+// ColumnWidth returns the current width of column col in Dp.
+func (g *DataGrid) ColumnWidth(col int) unit.Dp {
+	if col < 0 || col >= len(g.colWidths) {
+		return 0
+	}
+	return g.colWidths[col]
+}
+
+// TopRow returns the index of the first visible row.
+func (g *DataGrid) TopRow() int64 { return g.topRow }
+
+// ScrollX returns the current horizontal scroll offset in pixels.
+func (g *DataGrid) ScrollX() int { return g.scrollX }
+
 // ScrollToRow scrolls so that row is visible.
 func (g *DataGrid) ScrollToRow(row int64, visRows int64) {
 	if g.src == nil {
@@ -148,6 +170,23 @@ func (g *DataGrid) ScrollToRow(row int64, visRows int64) {
 	} else if visRows > 1 && row >= g.topRow+visRows-1 {
 		g.topRow = max(0, row-visRows+2)
 		g.subY = 0
+	}
+}
+
+// scrollToCol adjusts scrollX so that column col is visible within bodyW.
+func (g *DataGrid) scrollToCol(gtx layout.Context, col int, bodyW int) {
+	if col < 0 || col >= len(g.colWidths) || bodyW <= 0 {
+		return
+	}
+	colStart := 0
+	for i := 0; i < col; i++ {
+		colStart += gtx.Dp(g.colWidths[i])
+	}
+	colEnd := colStart + gtx.Dp(g.colWidths[col])
+	if colStart < g.scrollX {
+		g.scrollX = colStart
+	} else if colEnd > g.scrollX+bodyW {
+		g.scrollX = max(0, colEnd-bodyW)
 	}
 }
 
@@ -171,11 +210,17 @@ func (g *DataGrid) Layout(gtx layout.Context, th *theme.Theme) layout.Dimensions
 	headerH := gtx.Dp(30)
 	rowH := max(18, gtx.Dp(24))
 	vBarW := gtx.Dp(12)
+	hBarH := gtx.Dp(12)
 	gutterW := g.gutterWidth(gtx, totalRows)
 
 	bodyW := max(0, size.X-gutterW-vBarW)
-	bodyH := max(0, size.Y-headerH)
+	bodyH := max(0, size.Y-headerH-hBarH)
 	visRows := int64(bodyH/rowH) + 2
+
+	pxPerDp := gtx.Metric.PxPerDp
+	if pxPerDp <= 0 {
+		pxPerDp = 1
+	}
 
 	// 1. Handle column resize drags and header sort clicks.
 	for i := range cols {
@@ -186,10 +231,11 @@ func (g *DataGrid) Layout(gtx layout.Context, th *theme.Theme) layout.Dimensions
 			}
 			switch ev.Kind {
 			case pointer.Press:
-				g.colOrigins[i] = g.colWidths[i] - unit.Dp(ev.Position.X)/unit.Dp(gtx.Metric.PxPerDp)
+				g.colPressX[i] = ev.Position.X
+				g.colOrigins[i] = g.colWidths[i]
 			case pointer.Drag:
-				w := g.colOrigins[i] + unit.Dp(ev.Position.X)/unit.Dp(gtx.Metric.PxPerDp)
-				g.colWidths[i] = max(56, min(800, w))
+				delta := unit.Dp((ev.Position.X - g.colPressX[i]) / pxPerDp)
+				g.colWidths[i] = max(48, min(1200, g.colOrigins[i]+delta))
 			}
 		}
 		for {
@@ -217,36 +263,103 @@ func (g *DataGrid) Layout(gtx layout.Context, th *theme.Theme) layout.Dimensions
 	for _, w := range g.colWidths {
 		totalColsW += gtx.Dp(w)
 	}
-	maxScrollX := max(0, totalColsW-bodyW)
+	// Allow a small trailing margin when columns exceed or nearly fill the body
+	// so the rightmost column edge can always be scrolled into comfortable view.
+	contentW := totalColsW
+	if totalColsW > 0 {
+		contentW = totalColsW + gtx.Dp(32)
+	}
+	maxScrollX := max(0, contentW-bodyW)
 
-	// 2. Handle mouse wheel scrolling.
+	maxTopRow := max(int64(0), totalRows-max(1, int64(bodyH/rowH)))
+	canScrollV := maxTopRow > 0
+
+	anyRange := pointer.ScrollRange{Min: -1e6, Max: 1e6}
+
+	// 2. Handle mouse wheel scrolling:
+	// - vScroll: vertical wheel over body, gutter, or vertical scrollbar.
+	// - hScroll: Shift+wheel, tilt wheel, or trackpad horizontal swipe anywhere in grid.
+	// - hdrWheel / hBarWheel: vertical wheel over header or horizontal scrollbar pans horizontally.
 	if dy := g.vScroll.Update(gtx.Metric, gtx.Source, gtx.Now, gesture.Vertical,
-		pointer.ScrollRange{Min: -1e6, Max: 1e6},
-		pointer.ScrollRange{Min: -1e6, Max: 1e6},
+		pointer.ScrollRange{}, anyRange,
 	); dy != 0 {
-		g.scrollByPixels(dy, rowH, bodyH, totalRows)
+		if canScrollV {
+			g.scrollByPixels(dy, rowH, bodyH, totalRows)
+		} else if maxScrollX > 0 {
+			g.scrollX = max(0, min(maxScrollX, g.scrollX+dy))
+		}
 	}
 	if dx := g.hScroll.Update(gtx.Metric, gtx.Source, gtx.Now, gesture.Horizontal,
-		pointer.ScrollRange{Min: -maxScrollX, Max: maxScrollX},
-		pointer.ScrollRange{Min: -1e6, Max: 1e6},
+		anyRange, pointer.ScrollRange{},
 	); dx != 0 {
 		g.scrollX = max(0, min(maxScrollX, g.scrollX+dx))
 	}
+	if hdy := g.hdrWheel.Update(gtx.Metric, gtx.Source, gtx.Now, gesture.Vertical,
+		pointer.ScrollRange{}, anyRange,
+	); hdy != 0 {
+		g.scrollX = max(0, min(maxScrollX, g.scrollX+hdy))
+	}
+	if bdy := g.hBarWheel.Update(gtx.Metric, gtx.Source, gtx.Now, gesture.Vertical,
+		pointer.ScrollRange{}, anyRange,
+	); bdy != 0 {
+		g.scrollX = max(0, min(maxScrollX, g.scrollX+bdy))
+	}
 
-	// 3. Handle vertical scrollbar thumb/track dragging.
-	maxTopRow := max(int64(0), totalRows-max(1, int64(bodyH/rowH)))
+	// 3a. Handle vertical scrollbar thumb/track dragging.
+	vThumbH := g.vThumbHeight(bodyH, rowH, totalRows)
 	for {
 		ev, ok := g.vBarDrag.Update(gtx.Metric, gtx.Source, gesture.Vertical)
 		if !ok {
 			break
 		}
-		if (ev.Kind == pointer.Press || ev.Kind == pointer.Drag) && bodyH > 0 && maxTopRow > 0 {
-			thumbH := g.thumbHeight(bodyH, rowH, totalRows)
-			track := float64(max(1, bodyH-thumbH))
-			ratio := (float64(ev.Position.Y) - float64(thumbH)/2) / track
-			ratio = math.Max(0, math.Min(1, ratio))
-			g.topRow = int64(math.Round(ratio * float64(maxTopRow)))
-			g.subY = 0
+		if bodyH > 0 && maxTopRow > 0 {
+			localY := float64(ev.Position.Y) - float64(headerH)
+			trackSpan := float64(max(1, bodyH-vThumbH))
+			curRatio := float64(g.topRow) / float64(maxTopRow)
+			curThumbY := curRatio * trackSpan
+			switch ev.Kind {
+			case pointer.Press:
+				if localY >= curThumbY && localY <= curThumbY+float64(vThumbH) {
+					g.vBarGrabOffset = localY - curThumbY
+				} else {
+					g.vBarGrabOffset = float64(vThumbH) / 2
+					ratio := math.Max(0, math.Min(1, (localY-g.vBarGrabOffset)/trackSpan))
+					g.topRow = int64(math.Round(ratio * float64(maxTopRow)))
+					g.subY = 0
+				}
+			case pointer.Drag:
+				ratio := math.Max(0, math.Min(1, (localY-g.vBarGrabOffset)/trackSpan))
+				g.topRow = int64(math.Round(ratio * float64(maxTopRow)))
+				g.subY = 0
+			}
+		}
+	}
+
+	// 3b. Handle horizontal scrollbar thumb/track dragging.
+	hThumbW := g.hThumbWidth(bodyW, contentW)
+	for {
+		ev, ok := g.hBarDrag.Update(gtx.Metric, gtx.Source, gesture.Horizontal)
+		if !ok {
+			break
+		}
+		if bodyW > 0 && maxScrollX > 0 {
+			localX := float64(ev.Position.X) - float64(gutterW)
+			trackSpan := float64(max(1, bodyW-hThumbW))
+			curRatio := float64(g.scrollX) / float64(maxScrollX)
+			curThumbX := curRatio * trackSpan
+			switch ev.Kind {
+			case pointer.Press:
+				if localX >= curThumbX && localX <= curThumbX+float64(hThumbW) {
+					g.hBarGrabOffset = localX - curThumbX
+				} else {
+					g.hBarGrabOffset = float64(hThumbW) / 2
+					ratio := math.Max(0, math.Min(1, (localX-g.hBarGrabOffset)/trackSpan))
+					g.scrollX = int(math.Round(ratio * float64(maxScrollX)))
+				}
+			case pointer.Drag:
+				ratio := math.Max(0, math.Min(1, (localX-g.hBarGrabOffset)/trackSpan))
+				g.scrollX = int(math.Round(ratio * float64(maxScrollX)))
+			}
 		}
 	}
 
@@ -274,7 +387,7 @@ func (g *DataGrid) Layout(gtx layout.Context, th *theme.Theme) layout.Dimensions
 			}
 		}
 	}
-	g.handleKeys(gtx, totalRows, len(cols), int64(max(1, bodyH/rowH)))
+	g.handleKeys(gtx, totalRows, len(cols), int64(max(1, bodyH/rowH)), bodyW)
 
 	// 5. Handle clicks inside the grid body.
 	for {
@@ -285,7 +398,7 @@ func (g *DataGrid) Layout(gtx layout.Context, th *theme.Theme) layout.Dimensions
 		if ev.Kind == gesture.KindClick {
 			y := int(ev.Position.Y) - headerH
 			x := int(ev.Position.X) - gutterW
-			if y >= 0 && x >= 0 && x < bodyW {
+			if y >= 0 && y < bodyH && x >= 0 && x < bodyW {
 				clickedRow := g.topRow + int64((y+g.subY)/rowH)
 				if clickedRow >= 0 && clickedRow < totalRows {
 					clickedCol := g.colAtX(gtx, x+g.scrollX)
@@ -312,12 +425,15 @@ func (g *DataGrid) Layout(gtx layout.Context, th *theme.Theme) layout.Dimensions
 	// Determine visible column span [firstCol, lastCol] to virtualize columns.
 	firstCol, firstColX, lastCol := g.visibleCols(gtx, bodyW)
 
-	// 6. Draw visible rows in the body area.
-	bodyRect := image.Rect(gutterW, headerH, gutterW+bodyW, size.Y)
+	// 6. Draw visible rows in the body area and register body-only key/click handlers.
+	bodyRect := image.Rect(gutterW, headerH, gutterW+bodyW, headerH+bodyH)
 	bodyClip := clip.Rect(bodyRect).Push(gtx.Ops)
+	event.Op(gtx.Ops, &g.keyTag)
+	g.bodyClick.Add(gtx.Ops)
+
 	for r := g.topRow; r <= lastVis && r < totalRows; r++ {
 		y := headerH + int(r-g.topRow)*rowH - g.subY
-		if y >= size.Y {
+		if y >= headerH+bodyH {
 			break
 		}
 		if y+rowH <= headerH {
@@ -352,12 +468,12 @@ func (g *DataGrid) Layout(gtx layout.Context, th *theme.Theme) layout.Dimensions
 	bodyClip.Pop()
 
 	// 7. Draw frozen left row-number gutter.
-	gutterClip := clip.Rect(image.Rect(0, headerH, gutterW, size.Y)).Push(gtx.Ops)
-	theme.FillRect(gtx, clip.Rect{Min: image.Pt(0, headerH), Max: image.Pt(gutterW, size.Y)}, th.Chrome)
+	gutterClip := clip.Rect(image.Rect(0, headerH, gutterW, headerH+bodyH)).Push(gtx.Ops)
+	theme.FillRect(gtx, clip.Rect{Min: image.Pt(0, headerH), Max: image.Pt(gutterW, headerH+bodyH)}, th.Chrome)
 	edSrc, _ := g.src.(EditableGridSource)
 	for r := g.topRow; r <= lastVis && r < totalRows; r++ {
 		y := headerH + int(r-g.topRow)*rowH - g.subY
-		if y >= size.Y {
+		if y >= headerH+bodyH {
 			break
 		}
 		var rowDel, rowIns bool
@@ -408,26 +524,93 @@ func (g *DataGrid) Layout(gtx layout.Context, th *theme.Theme) layout.Dimensions
 	offCorner.Pop()
 	theme.FillRect(gtx, clip.Rect{Min: image.Pt(gutterW-1, 0), Max: image.Pt(gutterW, headerH)}, th.Border)
 
-	hdrClip := clip.Rect(image.Rect(gutterW, 0, gutterW+bodyW, headerH)).Push(gtx.Ops)
+	hdrRect := image.Rect(gutterW, 0, gutterW+bodyW, headerH)
+	hdrClip := clip.Rect(hdrRect).Push(gtx.Ops)
+
+	// Pass 1: Draw visible header cells and register sort click handlers.
 	hx := gutterW + firstColX - g.scrollX
 	for c := firstCol; c <= lastCol && c < len(cols); c++ {
 		cw := gtx.Dp(g.colWidths[c])
 		g.drawHeaderCell(gtx, th, c, cols[c], image.Rect(hx, 0, hx+cw, headerH))
 		hx += cw
 	}
+
+	// Pass 2: Register column resize drag handles on top of all header sort-click
+	// areas so adjacent column click regions never cover the resize handles.
+	resizeZone := gtx.Dp(6)
+	colEdgeX := gutterW - g.scrollX
+	activeGuideX := -1
+	for c := range cols {
+		cw := gtx.Dp(g.colWidths[c])
+		edgeX := colEdgeX + cw
+		colEdgeX = edgeX
+
+		isDragging := g.colResizes[c].Dragging() || g.colResizes[c].Pressed()
+		isVisible := edgeX >= gutterW-resizeZone && edgeX <= gutterW+bodyW+resizeZone
+		if !isVisible && !isDragging {
+			continue
+		}
+		if isDragging {
+			theme.FillRect(gtx, clip.Rect{
+				Min: image.Pt(edgeX-1, 2),
+				Max: image.Pt(edgeX+1, headerH-2),
+			}, th.Accent)
+			activeGuideX = edgeX
+		}
+		hit := clip.Rect{
+			Min: image.Pt(edgeX-resizeZone, 0),
+			Max: image.Pt(edgeX+resizeZone, headerH),
+		}.Push(gtx.Ops)
+		pointer.CursorColResize.Add(gtx.Ops)
+		g.colResizes[c].Add(gtx.Ops)
+		hit.Pop()
+	}
+
 	hdrClip.Pop()
 	theme.FillRect(gtx, clip.Rect{Min: image.Pt(0, headerH-1), Max: image.Pt(size.X, headerH)}, th.Border)
 
-	// 9. Draw vertical scrollbar.
-	g.drawVScrollbar(gtx, th, image.Rect(size.X-vBarW, headerH, size.X, size.Y), rowH, totalRows)
+	// Draw full-height vertical guide line when actively dragging a column edge.
+	if activeGuideX >= gutterW && activeGuideX <= gutterW+bodyW {
+		theme.FillRect(gtx, clip.Rect{
+			Min: image.Pt(activeGuideX, headerH),
+			Max: image.Pt(activeGuideX+1, headerH+bodyH),
+		}, th.Accent)
+	}
 
-	// 10. Register input handlers over the whole grid.
-	whole := clip.Rect{Max: size}.Push(gtx.Ops)
-	event.Op(gtx.Ops, &g.keyTag)
-	g.vScroll.Add(gtx.Ops)
+	// 9. Draw vertical scrollbar on the right and horizontal scrollbar at the bottom.
+	g.drawVScrollbar(gtx, th, image.Rect(size.X-vBarW, headerH, size.X, headerH+bodyH), rowH, totalRows)
+	g.drawHScrollbar(gtx, th, image.Rect(gutterW, headerH+bodyH, gutterW+bodyW, size.Y), bodyW, contentW, maxScrollX)
+
+	// Fill bottom-left gutter corner and bottom-right scrollbar intersection corner.
+	theme.FillRect(gtx, clip.Rect{Min: image.Pt(0, headerH+bodyH), Max: image.Pt(gutterW, size.Y)}, th.Chrome)
+	theme.FillRect(gtx, clip.Rect{Min: image.Pt(0, headerH+bodyH), Max: image.Pt(gutterW, headerH+bodyH+1)}, th.Border)
+	theme.FillRect(gtx, clip.Rect{Min: image.Pt(gutterW-1, headerH+bodyH), Max: image.Pt(gutterW, size.Y)}, th.Border)
+
+	theme.FillRect(gtx, clip.Rect{Min: image.Pt(size.X-vBarW, headerH+bodyH), Max: size}, th.Chrome)
+	theme.FillRect(gtx, clip.Rect{Min: image.Pt(size.X-vBarW, headerH+bodyH), Max: image.Pt(size.X, headerH+bodyH+1)}, th.Border)
+	theme.FillRect(gtx, clip.Rect{Min: image.Pt(size.X-vBarW, headerH+bodyH), Max: image.Pt(size.X-vBarW+1, size.Y)}, th.Border)
+
+	// 10. Register pass-through mouse wheel handlers across disjoint vertical bands
+	// and a whole-grid horizontal wheel handler so clicks/drags pass through untouched.
+	passScroll := pointer.PassOp{}.Push(gtx.Ops)
+
+	wholeScrollClip := clip.Rect{Max: size}.Push(gtx.Ops)
 	g.hScroll.Add(gtx.Ops)
-	g.bodyClick.Add(gtx.Ops)
-	whole.Pop()
+	wholeScrollClip.Pop()
+
+	midScrollClip := clip.Rect(image.Rect(0, headerH, size.X, headerH+bodyH)).Push(gtx.Ops)
+	g.vScroll.Add(gtx.Ops)
+	midScrollClip.Pop()
+
+	hdrWheelClip := clip.Rect(image.Rect(0, 0, size.X, headerH)).Push(gtx.Ops)
+	g.hdrWheel.Add(gtx.Ops)
+	hdrWheelClip.Pop()
+
+	hBarWheelClip := clip.Rect(image.Rect(0, headerH+bodyH, size.X, size.Y)).Push(gtx.Ops)
+	g.hBarWheel.Add(gtx.Ops)
+	hBarWheelClip.Pop()
+
+	passScroll.Pop()
 
 	return layout.Dimensions{Size: size}
 }
@@ -466,23 +649,11 @@ func (g *DataGrid) drawHeaderCell(gtx layout.Context, th *theme.Theme, idx int, 
 	}, th.Border)
 	cellClip.Pop()
 
-	// Sort click region (excludes the rightmost 6dp resize zone).
-	sortHit := clip.Rect{
-		Min: r.Min,
-		Max: image.Pt(max(r.Min.X, r.Max.X-gtx.Dp(6)), r.Max.Y),
-	}.Push(gtx.Ops)
+	// Sort click region across the header cell.
+	sortHit := clip.Rect(r).Push(gtx.Ops)
 	pointer.CursorPointer.Add(gtx.Ops)
 	g.colClicks[idx].Add(gtx.Ops)
 	sortHit.Pop()
-
-	// Column resize handle on the right edge.
-	hit := clip.Rect{
-		Min: image.Pt(r.Max.X-gtx.Dp(4), r.Min.Y),
-		Max: image.Pt(r.Max.X+gtx.Dp(4), r.Max.Y),
-	}.Push(gtx.Ops)
-	pointer.CursorColResize.Add(gtx.Ops)
-	g.colResizes[idx].Add(gtx.Ops)
-	hit.Pop()
 }
 
 func (g *DataGrid) drawCell(gtx layout.Context, th *theme.Theme, row int64, col int, r image.Rectangle) {
@@ -593,24 +764,23 @@ func (g *DataGrid) drawVScrollbar(gtx layout.Context, th *theme.Theme, r image.R
 
 	bodyH := r.Dy()
 	visRows := int64(max(1, bodyH/rowH))
-	if totalRows <= visRows || bodyH <= 0 {
-		return
-	}
-	thumbH := g.thumbHeight(bodyH, rowH, totalRows)
-	maxTop := max(int64(1), totalRows-visRows)
-	ratio := float64(g.topRow) / float64(maxTop)
-	ratio = math.Max(0, math.Min(1, ratio))
-	thumbY := r.Min.Y + int(math.Round(ratio*float64(bodyH-thumbH)))
+	if totalRows > visRows && bodyH > 0 {
+		thumbH := g.vThumbHeight(bodyH, rowH, totalRows)
+		maxTop := max(int64(1), totalRows-visRows)
+		ratio := float64(g.topRow) / float64(maxTop)
+		ratio = math.Max(0, math.Min(1, ratio))
+		thumbY := r.Min.Y + int(math.Round(ratio*float64(bodyH-thumbH)))
 
-	thumbCol := th.TextSubtle
-	if g.vBarDrag.Dragging() || g.vBarDrag.Pressed() {
-		thumbCol = th.Accent
+		thumbCol := th.TextSubtle
+		if g.vBarDrag.Dragging() || g.vBarDrag.Pressed() {
+			thumbCol = th.Accent
+		}
+		thumb := clip.RRect{
+			Rect: image.Rect(r.Min.X+3, thumbY+2, r.Max.X-3, thumbY+thumbH-2),
+			NE:   gtx.Dp(3), NW: gtx.Dp(3), SE: gtx.Dp(3), SW: gtx.Dp(3),
+		}
+		theme.FillRRect(gtx, thumb, thumbCol)
 	}
-	thumb := clip.RRect{
-		Rect: image.Rect(r.Min.X+3, thumbY+2, r.Max.X-3, thumbY+thumbH-2),
-		NE:   gtx.Dp(3), NW: gtx.Dp(3), SE: gtx.Dp(3), SW: gtx.Dp(3),
-	}
-	theme.FillRRect(gtx, thumb, thumbCol)
 
 	hit := clip.Rect(r).Push(gtx.Ops)
 	pointer.CursorPointer.Add(gtx.Ops)
@@ -618,13 +788,48 @@ func (g *DataGrid) drawVScrollbar(gtx layout.Context, th *theme.Theme, r image.R
 	hit.Pop()
 }
 
-func (g *DataGrid) thumbHeight(bodyH, rowH int, totalRows int64) int {
+func (g *DataGrid) drawHScrollbar(gtx layout.Context, th *theme.Theme, r image.Rectangle, bodyW, contentW, maxScrollX int) {
+	theme.FillRect(gtx, clip.Rect(r), th.Chrome)
+	theme.FillRect(gtx, clip.Rect{Min: r.Min, Max: image.Pt(r.Max.X, r.Min.Y+1)}, th.Border)
+
+	if maxScrollX > 0 && bodyW > 0 {
+		thumbW := g.hThumbWidth(bodyW, contentW)
+		ratio := float64(g.scrollX) / float64(maxScrollX)
+		ratio = math.Max(0, math.Min(1, ratio))
+		thumbX := r.Min.X + int(math.Round(ratio*float64(bodyW-thumbW)))
+
+		thumbCol := th.TextSubtle
+		if g.hBarDrag.Dragging() || g.hBarDrag.Pressed() {
+			thumbCol = th.Accent
+		}
+		thumb := clip.RRect{
+			Rect: image.Rect(thumbX+2, r.Min.Y+3, thumbX+thumbW-2, r.Max.Y-3),
+			NE:   gtx.Dp(3), NW: gtx.Dp(3), SE: gtx.Dp(3), SW: gtx.Dp(3),
+		}
+		theme.FillRRect(gtx, thumb, thumbCol)
+	}
+
+	hit := clip.Rect(r).Push(gtx.Ops)
+	pointer.CursorPointer.Add(gtx.Ops)
+	g.hBarDrag.Add(gtx.Ops)
+	hit.Pop()
+}
+
+func (g *DataGrid) vThumbHeight(bodyH, rowH int, totalRows int64) int {
 	if totalRows <= 0 {
 		return bodyH
 	}
 	vis := float64(bodyH) / float64(rowH)
 	h := int(float64(bodyH) * (vis / float64(totalRows)))
 	return max(24, min(bodyH, h))
+}
+
+func (g *DataGrid) hThumbWidth(bodyW, contentW int) int {
+	if contentW <= 0 || contentW <= bodyW {
+		return bodyW
+	}
+	w := int(float64(bodyW) * (float64(bodyW) / float64(contentW)))
+	return max(28, min(bodyW, w))
 }
 
 func (g *DataGrid) scrollByPixels(dy, rowH, bodyH int, totalRows int64) {
@@ -746,7 +951,7 @@ func (g *DataGrid) cancelInlineEdit(gtx layout.Context) {
 	gtx.Execute(key.FocusCmd{Tag: &g.keyTag})
 }
 
-func (g *DataGrid) handleKeys(gtx layout.Context, totalRows int64, ncols int, pageRows int64) {
+func (g *DataGrid) handleKeys(gtx layout.Context, totalRows int64, ncols int, pageRows int64, bodyW int) {
 	for {
 		ev, ok := gtx.Event(
 			key.Filter{Focus: &g.keyTag, Name: key.NameUpArrow},
@@ -807,6 +1012,7 @@ func (g *DataGrid) handleKeys(gtx layout.Context, totalRows int64, ncols int, pa
 		}
 		g.selectCell(r, c)
 		g.ScrollToRow(r, pageRows)
+		g.scrollToCol(gtx, c, bodyW)
 	}
 }
 

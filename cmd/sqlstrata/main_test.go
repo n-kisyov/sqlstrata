@@ -110,3 +110,80 @@ func TestRenderOpenedDB(t *testing.T) {
 	}
 }
 
+func TestSelectIndexShowsStructure(t *testing.T) {
+	dbPath := filepath.Join("..", "..", "testdata", "small.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Skipf("small.db not found: %v", err)
+	}
+
+	sz := image.Pt(1360, 840)
+	hw, err := headless.NewWindow(sz.X, sz.Y)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hw.Release()
+
+	ui := newUI(new(app.Window))
+	db, err := engine.Open(dbPath, engine.DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var schema *engine.Schema
+	if err := db.Fg.Do(context.Background(), func(c *sqlite3.Conn) error {
+		var err error
+		schema, err = engine.LoadSchema(c)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ui.db = db
+	ui.schema = schema
+	ui.tree.SetSchema(schema)
+
+	idx := schema.Find("orders_created")
+	if idx == nil || idx.Type != engine.TypeIndex {
+		t.Fatalf("orders_created index not found: %+v", idx)
+	}
+	ui.tree.SelectObject(idx)
+	ui.selectObject(idx)
+
+	// Wait briefly for LoadIndexInfo on db.Fg.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ui.mu.Lock()
+		done := ui.structIndex != nil
+		ui.mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if ui.activeTab != tabStructure {
+		t.Fatalf("expected activeTab == tabStructure, got %v", ui.activeTab)
+	}
+	src := ui.structGrid.Source()
+	if src == nil || src.RowCount() < 1 {
+		t.Fatalf("expected index column rows in structGrid, got %+v", src)
+	}
+	colName, _, _, ok := src.Cell(0, 1)
+	if !ok || colName != "created_at" {
+		t.Fatalf("expected index column 0 to be 'created_at', got %q (ok=%v)", colName, ok)
+	}
+
+	var ops op.Ops
+	gtx := layout.Context{
+		Ops:         &ops,
+		Metric:      unit.Metric{PxPerDp: 1, PxPerSp: 1},
+		Constraints: layout.Exact(sz),
+		Now:         time.Now(),
+	}
+	ui.layout(gtx)
+	if err := hw.Frame(&ops); err != nil {
+		t.Fatal(err)
+	}
+}
+

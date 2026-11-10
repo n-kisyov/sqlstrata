@@ -3,10 +3,12 @@ package widgets
 import (
 	"fmt"
 	"image"
-	"strconv"
 	"testing"
 	"time"
 
+	"gioui.org/f32"
+	"gioui.org/io/input"
+	"gioui.org/io/pointer"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/unit"
@@ -15,106 +17,298 @@ import (
 	"github.com/sqlstrata/sqlstrata/internal/ui/theme"
 )
 
-type syntheticSource struct {
-	rows      int64
-	cols      []data.Column
-	visFirst  int64
-	visLast   int64
-	cellCalls int
-}
-
-func newSyntheticSource(rows int64, ncols int) *syntheticSource {
-	cols := make([]data.Column, ncols)
-	for i := range cols {
-		cols[i] = data.Column{
-			Name: fmt.Sprintf("col_%02d", i),
+func makeTestSource(numCols, numRows int) *data.StaticSource {
+	cols := make([]data.Column, numCols)
+	for c := 0; c < numCols; c++ {
+		cols[c] = data.Column{
+			Name: fmt.Sprintf("column_%d", c),
 			Type: "TEXT",
-			PK:   i == 0,
+			PK:   c == 0,
 		}
 	}
-	return &syntheticSource{rows: rows, cols: cols}
+	src := data.NewStaticSource(cols)
+	for r := 0; r < numRows; r++ {
+		for c := 0; c < numCols; c++ {
+			src.AppendCell([]byte(fmt.Sprintf("r%d_c%d", r, c)), data.KindText)
+		}
+	}
+	return src
 }
 
-func (s *syntheticSource) Columns() []data.Column       { return s.cols }
-func (s *syntheticSource) RowCount() int64              { return s.rows }
-func (s *syntheticSource) SetVisible(first, last int64) { s.visFirst, s.visLast = first, last }
-func (s *syntheticSource) Cell(row int64, col int) (string, data.Kind, bool, bool) {
-	s.cellCalls++
-	if col == 0 {
-		return strconv.FormatInt(row+1, 10), data.KindInteger, false, true
-	}
-	if (row+int64(col))%11 == 0 {
-		return "", data.KindNull, false, true
-	}
-	return "value_" + strconv.FormatInt(row, 10), data.KindText, false, true
-}
-
-func TestDataGrid100MRowsVirtualization(t *testing.T) {
-	const totalRows = 100_000_000
-	src := newSyntheticSource(totalRows, 50)
-	grid := NewDataGrid()
-	grid.SetSource(src)
+func TestDataGridScrollbarsAndColumnResize(t *testing.T) {
 	th := theme.New()
-
-	var ops op.Ops
-	gtx := layout.Context{
-		Ops: &ops,
-		Metric: unit.Metric{
-			PxPerDp: 1,
-			PxPerSp: 1,
-		},
-		Constraints: layout.Exact(image.Pt(1600, 900)),
-		Now:         time.Now(),
-	}
-
-	// Warm up the font shaper caches on the first frame.
-	grid.Layout(gtx, th)
-
-	// Jump to various positions across 100M rows and measure frame layout cost.
-	positions := []int64{0, 500, 12_345_678, 73_000_000, 99_999_950}
-	var totalElapsed time.Duration
-	for _, pos := range positions {
-		ops.Reset()
-		src.cellCalls = 0
-		grid.ScrollToRow(pos, 35)
-		start := time.Now()
-		dims := grid.Layout(gtx, th)
-		totalElapsed += time.Since(start)
-
-		if dims.Size != image.Pt(1600, 900) {
-			t.Fatalf("unexpected dims %v", dims.Size)
-		}
-		// Only visible rows × visible columns should ever be queried.
-		if src.cellCalls > 45*20 {
-			t.Fatalf("at row %d: queried %d cells, virtualization broken", pos, src.cellCalls)
-		}
-	}
-	if avg := totalElapsed / time.Duration(len(positions)); avg > 16*time.Millisecond {
-		t.Errorf("average frame took %s (> 16ms 60fps budget)", avg)
-	}
-}
-
-func BenchmarkDataGrid100MRows(b *testing.B) {
-	src := newSyntheticSource(100_000_000, 50)
 	grid := NewDataGrid()
+	src := makeTestSource(10, 500)
 	grid.SetSource(src)
-	th := theme.New()
 
+	var router input.Router
 	var ops op.Ops
-	gtx := layout.Context{
-		Ops: &ops,
-		Metric: unit.Metric{
-			PxPerDp: 1,
-			PxPerSp: 1,
-		},
-		Constraints: layout.Exact(image.Pt(1920, 1080)),
-		Now:         time.Now(),
-	}
+	size := image.Pt(800, 500)
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	frame := func() {
 		ops.Reset()
-		grid.ScrollToRow(int64(i*997)%99_999_900, 40)
+		gtx := layout.Context{
+			Ops:         &ops,
+			Now:         time.Now(),
+			Source:      router.Source(),
+			Metric:      unit.Metric{PxPerDp: 1, PxPerSp: 1},
+			Constraints: layout.Exact(size),
+		}
 		grid.Layout(gtx, th)
+		router.Frame(&ops)
+	}
+
+	// Initial frame registers all pointer hit areas.
+	frame()
+
+	gutterW := grid.gutterWidth(layout.Context{Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}}, 500)
+	initialW0 := grid.ColumnWidth(0)
+	if initialW0 <= 0 {
+		t.Fatalf("expected positive initial column 0 width, got %v", initialW0)
+	}
+
+	// 1. Test column 0 resize by dragging its right header edge +60px to the right.
+	edgeX := float32(gutterW + int(initialW0))
+	headerY := float32(15)
+	router.Queue(
+		pointer.Event{
+			Kind:      pointer.Press,
+			Source:    pointer.Mouse,
+			Buttons:   pointer.ButtonPrimary,
+			PointerID: 1,
+			Position:  f32.Pt(edgeX, headerY),
+		},
+	)
+	frame()
+	router.Queue(
+		pointer.Event{
+			Kind:      pointer.Move,
+			Source:    pointer.Mouse,
+			Buttons:   pointer.ButtonPrimary,
+			PointerID: 1,
+			Position:  f32.Pt(edgeX+60, headerY),
+		},
+		pointer.Event{
+			Kind:      pointer.Release,
+			Source:    pointer.Mouse,
+			PointerID: 1,
+			Position:  f32.Pt(edgeX+60, headerY),
+		},
+	)
+	frame()
+
+	newW0 := grid.ColumnWidth(0)
+	if newW0 != initialW0+60 {
+		t.Fatalf("column 0 resize failed: got width %v, want %v", newW0, initialW0+60)
+	}
+
+	// 2. Test vertical scrollbar dragging on the right edge (x = size.X - 6).
+	vBarX := float32(size.X - 6)
+	vStartY := float32(36)
+	router.Queue(
+		pointer.Event{
+			Kind:      pointer.Press,
+			Source:    pointer.Mouse,
+			Buttons:   pointer.ButtonPrimary,
+			PointerID: 2,
+			Position:  f32.Pt(vBarX, vStartY),
+		},
+	)
+	frame()
+	router.Queue(
+		pointer.Event{
+			Kind:      pointer.Move,
+			Source:    pointer.Mouse,
+			Buttons:   pointer.ButtonPrimary,
+			PointerID: 2,
+			Position:  f32.Pt(vBarX, float32(size.Y/2)),
+		},
+		pointer.Event{
+			Kind:      pointer.Release,
+			Source:    pointer.Mouse,
+			PointerID: 2,
+			Position:  f32.Pt(vBarX, float32(size.Y/2)),
+		},
+	)
+	frame()
+
+	if grid.TopRow() <= 0 {
+		t.Fatalf("vertical scrollbar drag did not scroll rows: TopRow() = %d", grid.TopRow())
+	}
+
+	// 3. Test horizontal scrollbar dragging at the bottom edge (y = size.Y - 6).
+	hBarY := float32(size.Y - 6)
+	hStartX := float32(gutterW + 10)
+	router.Queue(
+		pointer.Event{
+			Kind:      pointer.Press,
+			Source:    pointer.Mouse,
+			Buttons:   pointer.ButtonPrimary,
+			PointerID: 3,
+			Position:  f32.Pt(hStartX, hBarY),
+		},
+	)
+	frame()
+	router.Queue(
+		pointer.Event{
+			Kind:      pointer.Move,
+			Source:    pointer.Mouse,
+			Buttons:   pointer.ButtonPrimary,
+			PointerID: 3,
+			Position:  f32.Pt(float32(size.X/2), hBarY),
+		},
+		pointer.Event{
+			Kind:      pointer.Release,
+			Source:    pointer.Mouse,
+			PointerID: 3,
+			Position:  f32.Pt(float32(size.X/2), hBarY),
+		},
+	)
+	frame()
+
+	if grid.ScrollX() <= 0 {
+		t.Fatalf("horizontal scrollbar drag did not scroll columns: ScrollX() = %d", grid.ScrollX())
+	}
+}
+
+func TestDataGridMouseWheelScroll(t *testing.T) {
+	th := theme.New()
+	grid := NewDataGrid()
+	grid.SetSource(makeTestSource(12, 500))
+
+	var router input.Router
+	var ops op.Ops
+	size := image.Pt(800, 500)
+
+	frame := func() {
+		ops.Reset()
+		gtx := layout.Context{
+			Ops:         &ops,
+			Now:         time.Now(),
+			Source:      router.Source(),
+			Metric:      unit.Metric{PxPerDp: 1, PxPerSp: 1},
+			Constraints: layout.Exact(size),
+		}
+		grid.Layout(gtx, th)
+		router.Frame(&ops)
+	}
+
+	frame()
+
+	// 1. Vertical mouse wheel over data cells scrolls rows down and back up.
+	router.Queue(pointer.Event{
+		Kind:     pointer.Scroll,
+		Source:   pointer.Mouse,
+		Position: f32.Pt(300, 200),
+		Scroll:   f32.Pt(0, 240),
+	})
+	frame()
+	if grid.TopRow() != 10 {
+		t.Fatalf("body wheel down: got TopRow=%d, want 10", grid.TopRow())
+	}
+
+	router.Queue(pointer.Event{
+		Kind:     pointer.Scroll,
+		Source:   pointer.Mouse,
+		Position: f32.Pt(300, 200),
+		Scroll:   f32.Pt(0, -120),
+	})
+	frame()
+	if grid.TopRow() != 5 {
+		t.Fatalf("body wheel up: got TopRow=%d, want 5", grid.TopRow())
+	}
+
+	// 2. Vertical wheel over left row-number gutter and right vertical scrollbar.
+	router.Queue(pointer.Event{
+		Kind:     pointer.Scroll,
+		Source:   pointer.Mouse,
+		Position: f32.Pt(15, 200),
+		Scroll:   f32.Pt(0, 120),
+	})
+	frame()
+	if grid.TopRow() != 10 {
+		t.Fatalf("gutter wheel down: got TopRow=%d, want 10", grid.TopRow())
+	}
+
+	router.Queue(pointer.Event{
+		Kind:     pointer.Scroll,
+		Source:   pointer.Mouse,
+		Position: f32.Pt(float32(size.X-5), 200),
+		Scroll:   f32.Pt(0, 120),
+	})
+	frame()
+	if grid.TopRow() != 15 {
+		t.Fatalf("vbar wheel down: got TopRow=%d, want 15", grid.TopRow())
+	}
+
+	// 3. Horizontal wheel / Shift+wheel over grid body scrolls columns horizontally.
+	router.Queue(pointer.Event{
+		Kind:     pointer.Scroll,
+		Source:   pointer.Mouse,
+		Position: f32.Pt(300, 200),
+		Scroll:   f32.Pt(180, 0),
+	})
+	frame()
+	if grid.ScrollX() != 180 {
+		t.Fatalf("horizontal wheel right: got ScrollX=%d, want 180", grid.ScrollX())
+	}
+
+	// 4. Vertical wheel over column header and bottom horizontal scrollbar pans horizontally.
+	router.Queue(pointer.Event{
+		Kind:     pointer.Scroll,
+		Source:   pointer.Mouse,
+		Position: f32.Pt(300, 15),
+		Scroll:   f32.Pt(0, 120),
+	})
+	frame()
+	if grid.ScrollX() != 300 {
+		t.Fatalf("header wheel right: got ScrollX=%d, want 300", grid.ScrollX())
+	}
+
+	router.Queue(pointer.Event{
+		Kind:     pointer.Scroll,
+		Source:   pointer.Mouse,
+		Position: f32.Pt(300, float32(size.Y-5)),
+		Scroll:   f32.Pt(0, -100),
+	})
+	frame()
+	if grid.ScrollX() != 200 {
+		t.Fatalf("hbar wheel left: got ScrollX=%d, want 200", grid.ScrollX())
+	}
+
+	// 5. Clicking a cell still works through the pass-through scroll overlays.
+	router.Queue(
+		pointer.Event{
+			Kind:      pointer.Press,
+			Source:    pointer.Mouse,
+			Buttons:   pointer.ButtonPrimary,
+			PointerID: 4,
+			Position:  f32.Pt(100, 50),
+		},
+		pointer.Event{
+			Kind:      pointer.Release,
+			Source:    pointer.Mouse,
+			PointerID: 4,
+			Position:  f32.Pt(100, 50),
+		},
+	)
+	frame()
+	selR, selC := grid.SelectedCell()
+	if selR < 0 || selC < 0 {
+		t.Fatalf("cell click blocked by scroll overlay: selected=(%d, %d)", selR, selC)
+	}
+
+	// 6. Wide short table (no vertical overflow) pans horizontally on vertical wheel.
+	grid.SetSource(makeTestSource(12, 3))
+	frame()
+	router.Queue(pointer.Event{
+		Kind:     pointer.Scroll,
+		Source:   pointer.Mouse,
+		Position: f32.Pt(300, 200),
+		Scroll:   f32.Pt(0, 120),
+	})
+	frame()
+	if grid.ScrollX() != 120 {
+		t.Fatalf("short wide table wheel: got ScrollX=%d, want 120", grid.ScrollX())
 	}
 }

@@ -77,9 +77,18 @@ func (t *TreeView) SetSchema(s *engine.Schema) {
 	t.dirty = true
 }
 
-// Select sets the active object name.
+// Select sets the active object name (for tables/views) or node id.
 func (t *TreeView) Select(name string) {
 	t.selected = name
+}
+
+// SelectObject selects a specific schema object by type and name.
+func (t *TreeView) SelectObject(obj *engine.Object) {
+	if obj == nil {
+		t.selected = ""
+		return
+	}
+	t.selected = "obj:" + string(obj.Type) + ":" + obj.Name
 }
 
 func (t *TreeView) rebuild() {
@@ -266,22 +275,31 @@ func (t *TreeView) layoutRow(gtx layout.Context, th *theme.Theme, i int) layout.
 				t.collapsed[n.id] = !t.collapsed[n.id]
 				t.dirty = true
 			case nodeObject:
-				// Clicking the chevron region (leftmost 28dp) toggles columns;
-				// clicking the name selects the table/view.
+				// Clicking the chevron region toggles column subtrees;
+				// clicking anywhere selects the schema object (table, view, index, trigger).
 				chevW := gtx.Dp(unit.Dp(8 + n.depth*12 + 16))
 				if n.hasChild && (int(ev.Position.X) <= chevW || ev.NumClicks >= 2) {
 					t.expanded[n.id] = !t.expanded[n.id]
 					t.dirty = true
 				}
-				if (n.obj.Type == engine.TypeTable || n.obj.Type == engine.TypeView) && t.OnSelect != nil {
-					t.selected = n.obj.Name
-					t.OnSelect(n.obj)
+				if n.obj != nil {
+					t.selected = n.id
+					if t.OnSelect != nil {
+						t.OnSelect(n.obj)
+					}
 				}
 			}
 		}
 	}
 
-	isSel := n.kind == nodeObject && n.obj != nil && strings.EqualFold(n.obj.Name, t.selected)
+	isSel := false
+	if n.kind == nodeObject && n.obj != nil {
+		if strings.HasPrefix(t.selected, "obj:") {
+			isSel = n.id == t.selected
+		} else if t.selected != "" {
+			isSel = strings.EqualFold(n.obj.Name, t.selected)
+		}
+	}
 	if isSel {
 		theme.FillRect(gtx, clip.Rect{Min: image.Pt(4, 1), Max: image.Pt(w-4, rowH-1)}, th.Selected)
 		// Left accent indicator bar.

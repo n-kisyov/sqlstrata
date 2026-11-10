@@ -181,3 +181,89 @@ func tableColumns(db *sqlite3.Conn, table string) ([]Column, error) {
 
 // QuoteIdent quotes an SQL identifier.
 func QuoteIdent(name string) string { return sqlite3.QuoteIdentifier(name) }
+
+// IndexColumn describes one column (or expression/auxiliary key) of an index.
+type IndexColumn struct {
+	Seqno int
+	CID   int    // >=0 column index in table, -1 rowid/PK auxiliary, -2 expression
+	Name  string // column name, "(expr)", or "rowid"
+	Desc  bool
+	Coll  string
+	Key   bool // true for index key columns, false for auxiliary locator columns
+}
+
+// IndexInfo describes metadata returned by PRAGMA index_list and index_xinfo.
+type IndexInfo struct {
+	Unique  bool
+	Origin  string // "c" (CREATE INDEX), "u" (UNIQUE constraint), "pk" (PRIMARY KEY)
+	Partial bool
+	Columns []IndexColumn
+}
+
+// LoadIndexInfo inspects an index's columns, sort direction, collation, and flags
+// without scanning table data.
+func LoadIndexInfo(db *sqlite3.Conn, obj *Object) (*IndexInfo, error) {
+	if obj == nil || obj.Type != TypeIndex {
+		return nil, fmt.Errorf("engine: expected index object")
+	}
+	info := &IndexInfo{}
+
+	if stmt, _, err := db.Prepare(`SELECT "unique", origin, partial FROM pragma_index_list(?, 'main') WHERE name = ?`); err == nil {
+		_ = stmt.BindText(1, obj.Table)
+		_ = stmt.BindText(2, obj.Name)
+		if stmt.Step() {
+			info.Unique = stmt.ColumnBool(0)
+			info.Origin = stmt.ColumnText(1)
+			info.Partial = stmt.ColumnBool(2)
+		}
+		if cerr := stmt.Close(); cerr != nil {
+			return nil, cerr
+		}
+	}
+
+	stmt, _, err := db.Prepare(`SELECT seqno, cid, name, "desc", coll, "key" FROM pragma_index_xinfo(?, 'main') ORDER BY seqno`)
+	if err != nil {
+		return nil, err
+	}
+	if err := stmt.BindText(1, obj.Name); err != nil {
+		stmt.Close()
+		return nil, err
+	}
+	for stmt.Step() {
+		col := IndexColumn{
+			Seqno: stmt.ColumnInt(0),
+			CID:   stmt.ColumnInt(1),
+			Name:  stmt.ColumnText(2),
+			Desc:  stmt.ColumnBool(3),
+			Coll:  stmt.ColumnText(4),
+			Key:   stmt.ColumnBool(5),
+		}
+		if col.Name == "" {
+			switch col.CID {
+			case -1:
+				col.Name = "rowid"
+			case -2:
+				col.Name = "(expression)"
+			}
+		}
+		info.Columns = append(info.Columns, col)
+	}
+	if err := stmt.Close(); err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+// Related returns all objects of typ whose owning Table equals tableName.
+func (s *Schema) Related(tableName string, typ ObjectType) []*Object {
+	if s == nil {
+		return nil
+	}
+	var out []*Object
+	for _, o := range s.Objects {
+		if o.Type == typ && strings.EqualFold(o.Table, tableName) {
+			out = append(out, o)
+		}
+	}
+	return out
+}
