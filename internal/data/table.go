@@ -650,12 +650,14 @@ func (s *TableSource) FetchCellDetailAt(row int64, col int, offset int64, maxByt
 		var q string
 		if byRowid {
 			if offset > 0 {
-				q = fmt.Sprintf("SELECT length(%[1]s), substr(%[1]s, ?, ?) FROM %[2]s WHERE rowid = ?", colIdent, from)
+				q = fmt.Sprintf("SELECT length(CAST(%[1]s AS BLOB)), substr(%[1]s, ?, ?) FROM %[2]s WHERE rowid = ?", colIdent, from)
 			} else {
-				q = fmt.Sprintf("SELECT length(%[1]s), substr(%[1]s, 1, ?) FROM %[2]s WHERE rowid = ?", colIdent, from)
+				q = fmt.Sprintf("SELECT length(CAST(%[1]s AS BLOB)), substr(%[1]s, 1, ?) FROM %[2]s WHERE rowid = ?", colIdent, from)
 			}
+		} else if offset > 0 {
+			q = fmt.Sprintf("SELECT length(CAST(%[1]s AS BLOB)), substr(%[1]s, ?, ?) FROM %[2]s LIMIT 1 OFFSET ?", colIdent, from)
 		} else {
-			q = fmt.Sprintf("SELECT length(%[1]s), substr(%[1]s, 1, ?) FROM %[2]s LIMIT 1 OFFSET ?", colIdent, from)
+			q = fmt.Sprintf("SELECT length(CAST(%[1]s AS BLOB)), substr(%[1]s, 1, ?) FROM %[2]s LIMIT 1 OFFSET ?", colIdent, from)
 		}
 		stmt, _, err := db.Prepare(q)
 		if err != nil {
@@ -670,6 +672,10 @@ func (s *TableSource) FetchCellDetailAt(row int64, col int, offset int64, maxByt
 		case byRowid:
 			_ = stmt.BindInt(1, maxBytes)
 			_ = stmt.BindInt64(2, key.ID)
+		case offset > 0:
+			_ = stmt.BindInt64(1, offset+1)
+			_ = stmt.BindInt(2, maxBytes)
+			_ = stmt.BindInt64(3, row)
 		default:
 			_ = stmt.BindInt(1, maxBytes)
 			_ = stmt.BindInt64(2, row)
@@ -679,12 +685,8 @@ func (s *TableSource) FetchCellDetailAt(row int64, col int, offset int64, maxByt
 		}
 		raw := stmt.ColumnRawBlob(1)
 		det.Data = slices.Clone(raw)
-		if det.Kind == KindBlob {
-			det.TotalBytes = stmt.ColumnInt64(0)
-		} else {
-			det.TotalBytes = int64(len(det.Data))
-		}
-		det.Truncated = offset+int64(len(det.Data)) < det.TotalBytes || len(det.Data) >= maxBytes || offset > 0
+		det.TotalBytes = stmt.ColumnInt64(0)
+		det.Truncated = offset+int64(len(det.Data)) < det.TotalBytes || offset > 0
 		cb(det, nil)
 		return nil
 	}, func(err error) {
@@ -692,6 +694,76 @@ func (s *TableSource) FetchCellDetailAt(row int64, col int, offset int64, maxByt
 			cb(CellDetail{Row: row, Col: col}, err)
 		}
 	})
+}
+
+// ExportCellTo streams the full value of cell (row, col) to w (honoring any staged
+// edits and using SQLite incremental BLOB I/O when available).
+func (s *TableSource) ExportCellTo(row int64, col int, w io.Writer) (int64, error) {
+	if col < 0 || col >= len(s.cols) {
+		return 0, fmt.Errorf("column %d out of range", col)
+	}
+	key, hasKey := s.RowKey(row)
+	if s.changes != nil && hasKey {
+		if v, edited, _ := s.changes.LookupKey(key, col); edited {
+			if v.Null {
+				return 0, nil
+			}
+			var payload []byte
+			if v.Blob != nil {
+				payload = v.Blob
+			} else {
+				payload = []byte(v.Text)
+			}
+			n, err := w.Write(payload)
+			return int64(n), err
+		}
+	}
+
+	colName := s.cols[col].Name
+	colIdent := engine.QuoteIdent(colName)
+	from := s.from
+	byRowid := s.byRowid && hasKey && !key.Inserted
+	canOpenBlob := byRowid && s.obj.Type == engine.TypeTable && !s.obj.WithoutRowid
+
+	var written int64
+	err := s.db.Fg.Do(s.ctx, func(db *sqlite3.Conn) error {
+		if canOpenBlob {
+			if b, berr := db.OpenBlob("main", s.obj.Name, colName, key.ID, false); berr == nil {
+				defer b.Close()
+				buf := make([]byte, 64*1024)
+				n, cerr := io.CopyBuffer(w, b, buf)
+				written = n
+				return cerr
+			}
+		}
+		var q string
+		if byRowid {
+			q = fmt.Sprintf("SELECT %s FROM %s WHERE rowid = ?", colIdent, from)
+		} else {
+			q = fmt.Sprintf("SELECT %s FROM %s LIMIT 1 OFFSET ?", colIdent, from)
+		}
+		stmt, _, err := db.Prepare(q)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		if byRowid {
+			_ = stmt.BindInt64(1, key.ID)
+		} else {
+			_ = stmt.BindInt64(1, row)
+		}
+		if !stmt.Step() {
+			return stmt.Err()
+		}
+		if stmt.ColumnType(0) == sqlite3.NULL {
+			return nil
+		}
+		raw := stmt.ColumnRawBlob(0)
+		n, werr := w.Write(raw)
+		written = int64(n)
+		return werr
+	})
+	return written, err
 }
 
 func (s *TableSource) requestLocked(p int64) {

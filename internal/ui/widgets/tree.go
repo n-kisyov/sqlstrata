@@ -275,14 +275,15 @@ func (t *TreeView) layoutRow(gtx layout.Context, th *theme.Theme, i int) layout.
 				t.collapsed[n.id] = !t.collapsed[n.id]
 				t.dirty = true
 			case nodeObject:
-				// Clicking the chevron region toggles column subtrees;
-				// clicking anywhere selects the schema object (table, view, index, trigger).
+				// Clicking the chevron region toggles column subtrees without resetting
+				// active table state; clicking the object name selects and opens it.
 				chevW := gtx.Dp(unit.Dp(8 + n.depth*12 + 16))
-				if n.hasChild && (int(ev.Position.X) <= chevW || ev.NumClicks >= 2) {
+				isChev := n.hasChild && int(ev.Position.X) <= chevW
+				if isChev || (n.hasChild && ev.NumClicks >= 2) {
 					t.expanded[n.id] = !t.expanded[n.id]
 					t.dirty = true
 				}
-				if n.obj != nil {
+				if !isChev && n.obj != nil {
 					t.selected = n.id
 					if t.OnSelect != nil {
 						t.OnSelect(n.obj)
@@ -336,16 +337,20 @@ func (t *TreeView) layoutRow(gtx layout.Context, th *theme.Theme, i int) layout.
 		fnt.Weight = font.SemiBold
 	}
 
-	off := op.Offset(image.Pt(xLabel, yText)).Push(gtx.Ops)
-	cg := gtx
-	cg.Constraints.Max.X = max(0, w-xLabel-gtx.Dp(48))
-	th.LabelFont(cg, fnt, th.UISize, labelCol, text.Start, n.label)
-	off.Pop()
-
 	rightTxt := n.sub
 	if n.badge != "" {
 		rightTxt = n.badge
 	}
+	rightReserve := gtx.Dp(14)
+	if rightTxt != "" {
+		rightReserve = max(gtx.Dp(48), gtx.Dp(unit.Dp(len(rightTxt)*7+20)))
+	}
+	off := op.Offset(image.Pt(xLabel, yText)).Push(gtx.Ops)
+	cg := gtx
+	cg.Constraints.Max.X = max(0, w-xLabel-rightReserve)
+	th.LabelFont(cg, fnt, th.UISize, labelCol, text.Start, n.label)
+	off.Pop()
+
 	if rightTxt != "" {
 		off := op.Offset(image.Pt(0, gtx.Dp(6))).Push(gtx.Ops)
 		cg := gtx

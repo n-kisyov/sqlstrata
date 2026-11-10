@@ -93,6 +93,8 @@ type DataGrid struct {
 	OnSelectCell func(row int64, col int)
 	// OnCopy is called when the user copies a cell value with Ctrl+C.
 	OnCopy func(val string)
+	// OnTruncatedEdit is called when inline edit is blocked because cell text is truncated.
+	OnTruncatedEdit func(row int64, col int)
 }
 
 // NewDataGrid creates a ready-to-use DataGrid.
@@ -145,6 +147,9 @@ func (g *DataGrid) SetSource(src GridSource) {
 
 // Source returns the current GridSource.
 func (g *DataGrid) Source() GridSource { return g.src }
+
+// Editing reports whether an inline cell editor is currently active.
+func (g *DataGrid) Editing() bool { return g.editing }
 
 // SelectedCell returns the selected (row, col), or (-1, -1) if none.
 func (g *DataGrid) SelectedCell() (int64, int) { return g.selRow, g.selCol }
@@ -930,8 +935,14 @@ func (g *DataGrid) startInlineEdit(gtx layout.Context, row int64, col int) {
 	if !ok || !edSrc.Editable() {
 		return
 	}
-	txt, kind, _, loaded := g.src.Cell(row, col)
+	txt, kind, trunc, loaded := g.src.Cell(row, col)
 	if !loaded || kind == data.KindBlob {
+		return
+	}
+	if trunc {
+		if g.OnTruncatedEdit != nil {
+			g.OnTruncatedEdit(row, col)
+		}
 		return
 	}
 	if kind == data.KindNull {

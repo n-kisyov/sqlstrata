@@ -19,6 +19,8 @@ import (
 	"github.com/ncruces/go-sqlite3"
 
 	"github.com/sqlstrata/sqlstrata/internal/data"
+	"github.com/sqlstrata/sqlstrata/internal/engine"
+	"github.com/sqlstrata/sqlstrata/internal/iofmt"
 	"github.com/sqlstrata/sqlstrata/internal/platform/win"
 	"github.com/sqlstrata/sqlstrata/internal/ui/theme"
 )
@@ -31,6 +33,21 @@ func (u *uiState) newDatabaseDialog() {
 			{Name: "All Files (*.*)", Pattern: "*.*"},
 		})
 		if ok && path != "" {
+			cleanNew := filepath.Clean(path)
+			u.mu.Lock()
+			var openPath string
+			if u.db != nil {
+				openPath = filepath.Clean(u.db.Path)
+			}
+			u.mu.Unlock()
+			if openPath != "" && strings.EqualFold(cleanNew, openPath) {
+				u.setStatus("Cannot overwrite the currently open database file")
+				return
+			}
+			// SaveFile confirmed overwrite if file existed; ensure a fresh empty DB.
+			for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+				_ = os.Remove(path + suffix)
+			}
 			u.openDatabase(path, false)
 		}
 	}()
@@ -90,8 +107,14 @@ func (u *uiState) refreshToolsInfo() {
 			}
 			return nil
 		})
-		u.toolsGrid.SetSource(src)
-		u.win.Invalidate()
+		u.postUI(func() {
+			u.mu.Lock()
+			same := u.db == db
+			u.mu.Unlock()
+			if same {
+				u.toolsGrid.SetSource(src)
+			}
+		})
 	}()
 }
 
@@ -146,7 +169,9 @@ func (u *uiState) runMaintenancePragma(label, pragmaSQL string) {
 				res = data.NewStaticSource([]data.Column{{Name: "result", Type: "TEXT"}})
 				res.AppendCell([]byte(label+": ok (0 issues)"), data.KindText)
 			}
-			u.toolsGrid.SetSource(res)
+			u.postUI(func() {
+				u.toolsGrid.SetSource(res)
+			})
 			u.setToolsStatus(fmt.Sprintf("%s completed in %s (%d row(s))", label, elapsed, res.RowCount()))
 		} else {
 			u.setToolsStatus(fmt.Sprintf("%s completed in %s", label, elapsed))
@@ -173,6 +198,10 @@ func (u *uiState) vacuumIntoDialog() {
 		if !ok || outPath == "" {
 			return
 		}
+		if strings.EqualFold(filepath.Clean(outPath), filepath.Clean(db.Path)) {
+			u.setToolsStatus("VACUUM INTO target cannot be the open database itself")
+			return
+		}
 		_ = os.Remove(outPath)
 		u.setToolsStatus("Running VACUUM INTO " + filepath.Base(outPath) + "…")
 		start := time.Now()
@@ -197,6 +226,160 @@ func (u *uiState) vacuumIntoDialog() {
 		}
 		u.setToolsStatus(fmt.Sprintf("Created compact copy %s%s in %s", filepath.Base(outPath), szTxt, time.Since(start).Round(time.Millisecond)))
 	}()
+}
+
+func (u *uiState) importCSVDialog() {
+	u.mu.Lock()
+	db := u.db
+	u.mu.Unlock()
+	if db == nil {
+		u.setStatus("Open a database first to import CSV/TSV")
+		return
+	}
+	if db.ReadOnly {
+		u.setToolsStatus("Cannot import CSV: database opened read-only")
+		return
+	}
+	hwnd := u.hwnd
+	go func() {
+		path, ok := win.OpenFile(hwnd, "Import CSV / TSV into New Table", []win.Filter{
+			{Name: "CSV / TSV Files (*.csv;*.tsv;*.txt)", Pattern: "*.csv;*.tsv;*.txt"},
+			{Name: "All Files (*.*)", Pattern: "*.*"},
+		})
+		if ok && path != "" {
+			u.importCSVFile(path)
+		}
+	}()
+}
+
+func (u *uiState) importCSVFile(csvPath string) {
+	u.mu.Lock()
+	db := u.db
+	schema := u.schema
+	u.mu.Unlock()
+	if db == nil {
+		return
+	}
+	if db.ReadOnly {
+		u.setToolsStatus("Cannot import CSV: database opened read-only")
+		return
+	}
+
+	tableName := uniqueCSVTableName(schema, csvPath)
+	u.setToolsStatus("Importing " + filepath.Base(csvPath) + " into " + tableName + "…")
+	start := time.Now()
+
+	f, err := os.Open(csvPath)
+	if err != nil {
+		u.setToolsStatus(fmt.Sprintf("CSV open failed: %v", err))
+		return
+	}
+	defer f.Close()
+
+	opt := iofmt.DefaultImportOptions(tableName)
+	var res iofmt.ImportResult
+	err = db.Fg.Do(context.Background(), func(c *sqlite3.Conn) error {
+		var ierr error
+		res, ierr = iofmt.ImportCSV(context.Background(), c, f, opt)
+		return ierr
+	})
+	if err != nil {
+		u.setToolsStatus(fmt.Sprintf("CSV import failed: %v", err))
+		return
+	}
+
+	u.refreshSchemaAsync(db)
+	u.refreshToolsInfo()
+	u.setToolsStatus(fmt.Sprintf("Imported %d rows into %q (%d cols, delim %q) in %s",
+		res.Rows, res.Table, len(res.Columns), res.Comma, time.Since(start).Round(time.Millisecond)))
+}
+
+func uniqueCSVTableName(schema *engine.Schema, csvPath string) string {
+	base := strings.TrimSuffix(filepath.Base(csvPath), filepath.Ext(csvPath))
+	base = strings.TrimSpace(base)
+	if base == "" {
+		base = "imported_csv"
+	}
+	if schema == nil || schema.Find(base) == nil {
+		return base
+	}
+	for n := 2; n < 1000; n++ {
+		cand := fmt.Sprintf("%s_%d", base, n)
+		if schema.Find(cand) == nil {
+			return cand
+		}
+	}
+	return fmt.Sprintf("%s_%d", base, time.Now().Unix())
+}
+
+func (u *uiState) exportSQLDialog() {
+	u.mu.Lock()
+	db := u.db
+	var dbPath string
+	if db != nil {
+		dbPath = db.Path
+	}
+	u.mu.Unlock()
+	if db == nil {
+		u.setStatus("Open a database first to export SQL dump")
+		return
+	}
+	stem := strings.TrimSuffix(filepath.Base(dbPath), filepath.Ext(dbPath))
+	if stem == "" {
+		stem = "database"
+	}
+	defaultName := stem + "_dump.sql"
+	hwnd := u.hwnd
+	go func() {
+		outPath, ok := win.SaveFile(hwnd, "Export Database as SQL Dump", defaultName, "sql", []win.Filter{
+			{Name: "SQL Script (*.sql)", Pattern: "*.sql"},
+			{Name: "All Files (*.*)", Pattern: "*.*"},
+		})
+		if ok && outPath != "" {
+			u.exportSQLDump(outPath)
+		}
+	}()
+}
+
+func (u *uiState) exportSQLDump(outPath string) {
+	u.mu.Lock()
+	db := u.db
+	u.mu.Unlock()
+	if db == nil {
+		return
+	}
+
+	u.setToolsStatus("Exporting SQL dump " + filepath.Base(outPath) + "…")
+	start := time.Now()
+	f, err := os.Create(outPath)
+	if err != nil {
+		u.setToolsStatus(fmt.Sprintf("SQL dump create failed: %v", err))
+		return
+	}
+
+	var rows int64
+	err = db.Bg.Do(context.Background(), func(c *sqlite3.Conn) error {
+		var derr error
+		rows, derr = iofmt.DumpDatabaseSQL(context.Background(), c, f)
+		return derr
+	})
+	cerr := f.Close()
+	if err != nil {
+		_ = os.Remove(outPath)
+		u.setToolsStatus(fmt.Sprintf("SQL dump failed: %v", err))
+		return
+	}
+	if cerr != nil {
+		_ = os.Remove(outPath)
+		u.setToolsStatus(fmt.Sprintf("SQL dump close failed: %v", cerr))
+		return
+	}
+	var szTxt string
+	if fi, serr := os.Stat(outPath); serr == nil {
+		szTxt = " (" + data.FormatSize(fi.Size()) + ")"
+	}
+	u.setToolsStatus(fmt.Sprintf("Exported %d rows to %s%s in %s",
+		rows, filepath.Base(outPath), szTxt, time.Since(start).Round(time.Millisecond)))
 }
 
 func (u *uiState) setToolsStatus(msg string) {
@@ -239,6 +422,12 @@ func (u *uiState) layoutToolsView(gtx layout.Context) layout.Dimensions {
 	if clicked(&u.btnToolsVacuumInto, gtx) {
 		u.vacuumIntoDialog()
 	}
+	if clicked(&u.btnToolsImportCSV, gtx) {
+		u.importCSVDialog()
+	}
+	if clicked(&u.btnToolsExportSQL, gtx) {
+		u.exportSQLDialog()
+	}
 
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -252,7 +441,9 @@ func (u *uiState) layoutToolsView(gtx layout.Context) layout.Dimensions {
 			x += u.drawPillButton(gtx, x, barH, "Integrity Check", false, false, &u.btnToolsIntegChk) + gtx.Dp(6)
 			x += u.drawPillButton(gtx, x, barH, "FK Check", false, false, &u.btnToolsFKChk) + gtx.Dp(6)
 			x += u.drawPillButton(gtx, x, barH, "Optimize", false, false, &u.btnToolsOptimize) + gtx.Dp(6)
-			x += u.drawPillButton(gtx, x, barH, "VACUUM INTO…", false, true, &u.btnToolsVacuumInto) + gtx.Dp(12)
+			x += u.drawPillButton(gtx, x, barH, "VACUUM INTO…", false, true, &u.btnToolsVacuumInto) + gtx.Dp(6)
+			x += u.drawPillButton(gtx, x, barH, "Import CSV…", false, false, &u.btnToolsImportCSV) + gtx.Dp(6)
+			x += u.drawPillButton(gtx, x, barH, "Export SQL…", false, false, &u.btnToolsExportSQL) + gtx.Dp(12)
 
 			if status != "" && x < w-gtx.Dp(40) {
 				off := op.Offset(image.Pt(x, gtx.Dp(11))).Push(gtx.Ops)

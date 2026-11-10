@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"image"
@@ -19,6 +20,7 @@ import (
 	"gioui.org/app"
 	"gioui.org/font"
 	"gioui.org/gesture"
+	"gioui.org/io/event"
 	"gioui.org/io/key"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
@@ -122,11 +124,40 @@ type uiState struct {
 	sqlSuggestClicks []gesture.Click
 	sqlHistClicks    []gesture.Click
 
-	// Structure view buttons.
-	btnBrowseTarget gesture.Click
-	btnQueryStruct  gesture.Click
-	btnCopyDDL      gesture.Click
-	structRelClicks []gesture.Click
+	// Structure view buttons & schema designer state.
+	btnBrowseTarget    gesture.Click
+	btnQueryStruct     gesture.Click
+	btnCopyDDL         gesture.Click
+	btnNewTable        gesture.Click
+	btnAddColToggle    gesture.Click
+	btnEmptyTable      gesture.Click
+	btnDropObject      gesture.Click
+	confirmEmptyTarget string
+	confirmDropType    engine.ObjectType
+	confirmDropName    string
+	structRelClicks    []gesture.Click
+
+	addColOpen    bool
+	addColName    widget.Editor
+	addColDflt    widget.Editor
+	addColTypeIdx int
+	addColNotNull bool
+	btnAddColType gesture.Click
+	btnAddColNN   gesture.Click
+	btnAddColSave gesture.Click
+	btnAddColCanc gesture.Click
+
+	newTableOpen      bool
+	ntTableName       widget.Editor
+	ntWithoutRowid    bool
+	ntStrict          bool
+	ntCols            []*designerColRow
+	ntColList         layout.List
+	btnNTWithoutRowid gesture.Click
+	btnNTStrict       gesture.Click
+	btnNTAddField     gesture.Click
+	btnNTCreate       gesture.Click
+	btnNTCancel       gesture.Click
 
 	// DB tools buttons.
 	btnToolsRefresh    gesture.Click
@@ -135,6 +166,8 @@ type uiState struct {
 	btnToolsFKChk      gesture.Click
 	btnToolsOptimize   gesture.Click
 	btnToolsVacuumInto gesture.Click
+	btnToolsImportCSV  gesture.Click
+	btnToolsExportSQL  gesture.Click
 
 	// Welcome screen buttons.
 	btnWelOpen   gesture.Click
@@ -161,12 +194,15 @@ type uiState struct {
 	paletteClicks []gesture.Click
 
 	mu          sync.Mutex
+	uiPending   []func()
 	sessionPath string
 	session     *sqlapp.Session
 	db          *engine.DB
 	dbSize      int64
 	schema      *engine.Schema
 	tableSrc    *data.TableSource
+	sqlSpool    *data.ResultSpool
+	inspectGrid *widgets.DataGrid
 	activeTable string
 	structObj   *engine.Object
 	structIndex *engine.IndexInfo
@@ -195,10 +231,14 @@ func newUI(w *app.Window) *uiState {
 		inspector:   widgets.NewInspector(),
 		reviewList:  layout.List{Axis: layout.Vertical},
 		paletteList: layout.List{Axis: layout.Vertical},
+		ntColList:   layout.List{Axis: layout.Vertical},
 		session:     &sqlapp.Session{},
 		statusMsg:   "Ready · Open a SQLite file (Ctrl+O) or try the 100M-row Demo",
 	}
 	u.ddlEdit.ReadOnly = true
+	u.addColName.SingleLine = true
+	u.addColDflt.SingleLine = true
+	u.ntTableName.SingleLine = true
 	u.filterEdit.SingleLine = true
 	u.filterEdit.Submit = true
 	u.gotoEdit.SingleLine = true
@@ -227,14 +267,23 @@ func newUI(w *app.Window) *uiState {
 	u.sqlGrid.OnCopy = onCopy
 	u.structGrid.OnCopy = onCopy
 	u.toolsGrid.OnCopy = onCopy
+	u.browseGrid.OnTruncatedEdit = func(row int64, col int) {
+		u.rightSplit.Collapsed = false
+		u.inspectFrom(u.browseGrid, row, col)
+		u.setStatus("Cell value > 256 B — edit safely in the Cell Inspector")
+	}
 
-	u.inspector.OnStageCell = func(row int64, col int, val edit.Value) {
+	u.inspector.OnStageCell = func(row int64, col int, orig edit.Value, hasOrig bool, val edit.Value) {
 		u.mu.Lock()
 		src := u.tableSrc
 		u.mu.Unlock()
-		if src != nil && src.StageCellEdit(row, col, val) {
-			u.inspectFrom(u.browseGrid, row, col)
-			u.win.Invalidate()
+		if src != nil {
+			if src.StageCellEditWithOrig(row, col, orig, hasOrig, val) {
+				u.inspectFrom(u.browseGrid, row, col)
+				u.win.Invalidate()
+			} else {
+				u.setStatus("Cannot stage cell: full original value not loaded or exceeds preview limit")
+			}
 		}
 	}
 	u.inspector.OnDeleteRow = func(row int64) {
@@ -242,13 +291,87 @@ func newUI(w *app.Window) *uiState {
 		src := u.tableSrc
 		u.mu.Unlock()
 		if src != nil && src.Editable() {
-			if rowid, ok := src.RowKey(row); ok {
-				src.Changes().ToggleDelete(rowid)
+			if key, ok := src.RowKey(row); ok {
+				src.Changes().ToggleDeleteKey(key)
 				u.win.Invalidate()
 			}
 		}
 	}
+	u.inspector.OnLoadOffset = func(row int64, col int, offset int64) {
+		u.mu.Lock()
+		src := u.tableSrc
+		ig := u.inspectGrid
+		u.mu.Unlock()
+		if src == nil || (ig != nil && ig != u.browseGrid) {
+			return
+		}
+		cols := src.Columns()
+		if col < 0 || col >= len(cols) {
+			return
+		}
+		colMeta := cols[col]
+		editable := src.Editable()
+		src.FetchCellDetailAt(row, col, offset, int(widgets.InspectorPageBytes), func(det data.CellDetail, err error) {
+			if err == nil {
+				u.postUI(func() {
+					u.inspector.SetDetail(det, colMeta, editable)
+				})
+			} else {
+				u.setStatus(fmt.Sprintf("Load cell offset failed: %v", err))
+			}
+		})
+	}
+	u.inspector.OnLoadImage = func(row int64, col int, wantBytes int) {
+		u.mu.Lock()
+		src := u.tableSrc
+		ig := u.inspectGrid
+		u.mu.Unlock()
+		if src == nil || (ig != nil && ig != u.browseGrid) {
+			return
+		}
+		cols := src.Columns()
+		if col < 0 || col >= len(cols) {
+			return
+		}
+		if wantBytes <= 0 || wantBytes > 8<<20 {
+			wantBytes = 8 << 20
+		}
+		colMeta := cols[col]
+		editable := src.Editable()
+		src.FetchCellDetailAt(row, col, 0, wantBytes, func(det data.CellDetail, err error) {
+			if err == nil {
+				u.postUI(func() {
+					u.inspector.SetDetail(det, colMeta, editable)
+				})
+			}
+		})
+	}
+	u.inspector.OnExportCell = func(row int64, col int) {
+		u.exportInspectedCell(row, col)
+	}
+	u.inspector.OnImportFile = func(row int64, col int) {
+		u.importFileIntoCell(row, col)
+	}
 	return u
+}
+
+func (u *uiState) postUI(fn func()) {
+	u.mu.Lock()
+	u.uiPending = append(u.uiPending, fn)
+	u.mu.Unlock()
+	if u.win != nil {
+		u.win.Invalidate()
+	}
+}
+
+func (u *uiState) drainUI() {
+	u.mu.Lock()
+	pending := u.uiPending
+	u.uiPending = nil
+	u.mu.Unlock()
+	for _, fn := range pending {
+		fn()
+	}
 }
 
 func (u *uiState) initSession() {
@@ -307,21 +430,175 @@ func (u *uiState) inspectFrom(g *widgets.DataGrid, row int64, col int) {
 	if !ok {
 		return
 	}
+	u.mu.Lock()
+	u.inspectGrid = g
+	u.mu.Unlock()
 	ts, isTable := src.(*data.TableSource)
 	editable := isTable && ts.Editable()
 	u.inspector.SetCell(row, col, cols[col], val, kind, trunc, editable)
 
-	// Stream the full value (up to 64 KB) when inspecting a TableSource cell
-	// that is either a BLOB or truncated text.
+	// Stream the full value when inspecting a TableSource cell that is either a
+	// BLOB (64 KB window) or truncated text (up to 256 KB).
 	if isTable && (kind == data.KindBlob || trunc) {
 		colMeta := cols[col]
-		ts.FetchCellDetail(row, col, 64*1024, func(det data.CellDetail, err error) {
+		limit := 256 * 1024
+		if kind == data.KindBlob {
+			limit = 64 * 1024
+		}
+		ts.FetchCellDetail(row, col, limit, func(det data.CellDetail, err error) {
 			if err == nil {
-				u.inspector.SetDetail(det, colMeta, editable)
-				u.win.Invalidate()
+				u.postUI(func() {
+					u.inspector.SetDetail(det, colMeta, editable)
+				})
 			}
 		})
 	}
+}
+
+func (u *uiState) exportInspectedCell(row int64, col int) {
+	u.mu.Lock()
+	ig := u.inspectGrid
+	ts := u.tableSrc
+	u.mu.Unlock()
+	if ig == nil {
+		ig = u.browseGrid
+	}
+	var tableSrc *data.TableSource
+	if ig == u.browseGrid && ts != nil {
+		tableSrc = ts
+	}
+	colName := u.inspector.ColumnName()
+	if colName == "" {
+		colName = fmt.Sprintf("col_%d", col+1)
+	}
+	rawPreview := u.inspector.RawBytes()
+	kind := u.inspector.Kind()
+
+	ext := "txt"
+	if imgFmt := widgets.DetectImageFormat(rawPreview); imgFmt != "" {
+		if imgFmt == "jpeg" {
+			ext = "jpg"
+		} else {
+			ext = imgFmt
+		}
+	} else if kind == data.KindBlob {
+		ext = "bin"
+	} else if len(rawPreview) > 0 && json.Valid(rawPreview) {
+		ext = "json"
+	}
+	defaultName := fmt.Sprintf("%s_row%d.%s", colName, row+1, ext)
+	hwnd := u.hwnd
+	go func() {
+		outPath, ok := win.SaveFile(hwnd, "Export Cell Value", defaultName, ext, []win.Filter{
+			{Name: "Matching File (*." + ext + ")", Pattern: "*." + ext},
+			{Name: "All Files (*.*)", Pattern: "*.*"},
+		})
+		if !ok || outPath == "" {
+			return
+		}
+		f, err := os.Create(outPath)
+		if err != nil {
+			u.setStatus(fmt.Sprintf("Export cell failed: %v", err))
+			return
+		}
+		var n int64
+		if tableSrc != nil {
+			n, err = tableSrc.ExportCellTo(row, col, f)
+		} else {
+			var nw int
+			nw, err = f.Write(rawPreview)
+			n = int64(nw)
+		}
+		cerr := f.Close()
+		if err != nil {
+			_ = os.Remove(outPath)
+			u.setStatus(fmt.Sprintf("Export cell failed: %v", err))
+			return
+		}
+		if cerr != nil {
+			_ = os.Remove(outPath)
+			u.setStatus(fmt.Sprintf("Export cell close failed: %v", cerr))
+			return
+		}
+		u.setStatus(fmt.Sprintf("Exported %s to %s", data.FormatSize(n), filepath.Base(outPath)))
+	}()
+}
+
+func (u *uiState) importFileIntoCell(row int64, col int) {
+	u.mu.Lock()
+	ts := u.tableSrc
+	ig := u.inspectGrid
+	u.mu.Unlock()
+	if ts == nil || !ts.Editable() || (ig != nil && ig != u.browseGrid) {
+		u.setStatus("Switch to an editable table row to import a file into this cell")
+		return
+	}
+	const maxImportCellBytes = 32 << 20
+	hwnd := u.hwnd
+	go func() {
+		path, ok := win.OpenFile(hwnd, "Import File into BLOB Cell (<= 32 MB)", []win.Filter{
+			{Name: "All Files (*.*)", Pattern: "*.*"},
+			{Name: "Images (*.png;*.jpg;*.jpeg;*.gif)", Pattern: "*.png;*.jpg;*.jpeg;*.gif"},
+		})
+		if !ok || path == "" {
+			return
+		}
+		fi, err := os.Stat(path)
+		if err != nil {
+			u.setStatus(fmt.Sprintf("Import cell failed: %v", err))
+			return
+		}
+		if fi.Size() > maxImportCellBytes {
+			u.setStatus(fmt.Sprintf("File %s (%s) exceeds 32 MB cell import limit", filepath.Base(path), data.FormatSize(fi.Size())))
+			return
+		}
+		payload, err := os.ReadFile(path)
+		if err != nil {
+			u.setStatus(fmt.Sprintf("Read file failed: %v", err))
+			return
+		}
+
+		// Load full original value for optimistic conflict checking & undo/redo.
+		type origRes struct {
+			det data.CellDetail
+			err error
+		}
+		ch := make(chan origRes, 1)
+		ts.FetchCellDetail(row, col, maxImportCellBytes+1, func(det data.CellDetail, ferr error) {
+			ch <- origRes{det, ferr}
+		})
+		res := <-ch
+		if res.err != nil {
+			u.setStatus(fmt.Sprintf("Load existing cell failed: %v", res.err))
+			return
+		}
+		if res.det.Truncated {
+			u.setStatus("Existing cell > 32 MB; set NULL via SQL before replacing")
+			return
+		}
+		var origVal edit.Value
+		switch res.det.Kind {
+		case data.KindNull:
+			origVal = edit.NullValue()
+		case data.KindInteger:
+			origVal = edit.ExactValue(edit.KindInt, string(res.det.Data), nil)
+		case data.KindReal:
+			origVal = edit.ExactValue(edit.KindReal, string(res.det.Data), nil)
+		case data.KindBlob:
+			origVal = edit.ExactValue(edit.KindBlob, "", res.det.Data)
+		default:
+			origVal = edit.ExactValue(edit.KindText, string(res.det.Data), nil)
+		}
+
+		u.postUI(func() {
+			if ts.StageCellEditWithOrig(row, col, origVal, true, edit.ExactValue(edit.KindBlob, "", payload)) {
+				u.inspectFrom(u.browseGrid, row, col)
+				u.setStatus(fmt.Sprintf("Staged %s BLOB from %s", data.FormatSize(int64(len(payload))), filepath.Base(path)))
+			} else {
+				u.setStatus("Failed to stage imported file")
+			}
+		})
+	}()
 }
 
 func (u *uiState) applyWindowStyle() {
@@ -376,15 +653,23 @@ func (u *uiState) openDatabase(path string, readOnly bool) {
 		u.mu.Lock()
 		oldDB := u.db
 		oldSrc := u.tableSrc
+		oldSpool := u.sqlSpool
 		u.db = db
 		u.dbSize = dbSize
 		u.schema = schema
 		u.tableSrc = nil
+		u.sqlSpool = nil
 		u.activeTable = ""
 		u.structObj = nil
 		u.structIndex = nil
 		u.structRel = nil
+		u.newTableOpen = false
+		u.addColOpen = false
+		u.confirmEmptyTarget = ""
+		u.confirmDropName = ""
+		u.confirmDropType = ""
 		u.toolsStatus = ""
+		u.sqlStatus = ""
 		modeTag := ""
 		if readOnly {
 			modeTag = " [Read-Only]"
@@ -399,29 +684,32 @@ func (u *uiState) openDatabase(path string, readOnly bool) {
 		if oldSrc != nil {
 			oldSrc.Close()
 		}
+		if oldSpool != nil {
+			_ = oldSpool.Close()
+		}
 		if oldDB != nil {
 			oldDB.Close()
 		}
 
-		u.tree.SetSchema(schema)
-		u.browseGrid.SetSource(nil)
-		u.structGrid.SetSource(nil)
-		u.inspector.Clear()
-		u.refreshToolsInfo()
 		u.win.Option(app.Title("SQLStrata — " + filepath.Base(path) + modeTag))
+		u.postUI(func() {
+			u.tree.SetSchema(schema)
+			u.browseGrid.SetSource(nil)
+			u.sqlGrid.SetSource(nil)
+			u.structGrid.SetSource(nil)
+			u.inspector.Clear()
 
-		if tables := schema.ByType(engine.TypeTable); len(tables) > 0 {
-			u.tree.SelectObject(tables[0])
-			u.selectObject(tables[0])
-		} else if len(schema.Objects) > 0 {
-			u.tree.SelectObject(schema.Objects[0])
-			u.selectObject(schema.Objects[0])
-		} else {
-			u.mu.Lock()
-			u.activeTab = tabSQL
-			u.mu.Unlock()
-		}
-		u.win.Invalidate()
+			if tables := schema.ByType(engine.TypeTable); len(tables) > 0 {
+				u.tree.SelectObject(tables[0])
+				u.selectObject(tables[0])
+			} else if len(schema.Objects) > 0 {
+				u.tree.SelectObject(schema.Objects[0])
+				u.selectObject(schema.Objects[0])
+			} else {
+				u.activeTab = tabSQL
+			}
+		})
+		u.refreshToolsInfo()
 	}()
 }
 
@@ -473,15 +761,20 @@ func (u *uiState) selectObject(obj *engine.Object) {
 
 func (u *uiState) loadDemo100M() {
 	u.mu.Lock()
-	if u.tableSrc != nil {
-		u.tableSrc.Close()
-		u.tableSrc = nil
-	}
+	oldSrc := u.tableSrc
+	u.tableSrc = nil
+	u.structObj = nil
+	u.structIndex = nil
+	u.structRel = nil
 	u.activeTable = "synthetic_100M"
 	u.statusMsg = "100,000,000-row virtualized demo active — drag the scrollbar anywhere"
 	u.mu.Unlock()
+	if oldSrc != nil {
+		oldSrc.Close()
+	}
 
 	u.browseGrid.SetSource(data.NewDemo100MSource(100_000_000))
+	u.structGrid.SetSource(nil)
 	u.inspector.Clear()
 	u.activeTab = tabBrowse
 	u.win.Invalidate()
@@ -506,11 +799,10 @@ func (u *uiState) commitChanges() {
 			return
 		}
 		src.Reload()
-		u.mu.Lock()
-		u.activeTab = tabBrowse
-		u.statusMsg = fmt.Sprintf("Committed %d change(s) in %s", n, time.Since(start).Round(time.Microsecond))
-		u.mu.Unlock()
-		u.win.Invalidate()
+		u.postUI(func() {
+			u.activeTab = tabBrowse
+			u.setStatus(fmt.Sprintf("Committed %d change(s) in %s", n, time.Since(start).Round(time.Microsecond)))
+		})
 	}()
 }
 
@@ -543,6 +835,9 @@ func (u *uiState) run() error {
 			u.mu.Lock()
 			if u.tableSrc != nil {
 				u.tableSrc.Close()
+			}
+			if u.sqlSpool != nil {
+				_ = u.sqlSpool.Close()
 			}
 			if u.db != nil {
 				u.db.Close()
@@ -579,24 +874,38 @@ func (u *uiState) toggleTheme() {
 }
 
 func (u *uiState) layout(gtx layout.Context) layout.Dimensions {
+	u.drainUI()
 	theme.Fill(gtx, u.th.Window)
+
+	editorFocused := gtx.Focused(&u.sqlEdit) || gtx.Focused(&u.ddlEdit) ||
+		gtx.Focused(&u.filterEdit) || gtx.Focused(&u.gotoEdit) ||
+		gtx.Focused(&u.paletteEdit) || u.browseGrid.Editing() ||
+		u.inspector.HasFocus(gtx) || u.structureHasFocus(gtx)
+
+	filters := []event.Filter{
+		key.Filter{Name: "O", Required: key.ModCtrl, Optional: key.ModShift},
+		key.Filter{Name: "N", Required: key.ModCtrl},
+		key.Filter{Name: "B", Required: key.ModCtrl},
+		key.Filter{Name: "I", Required: key.ModCtrl},
+		key.Filter{Name: "S", Required: key.ModCtrl},
+		key.Filter{Name: "P", Required: key.ModCtrl, Optional: key.ModShift},
+		key.Filter{Name: key.NameReturn, Required: key.ModCtrl},
+		key.Filter{Name: key.NameEnter, Required: key.ModCtrl},
+		key.Filter{Name: key.NameF5},
+	}
+	if !editorFocused && (u.activeTab == tabBrowse || u.activeTab == tabReview) {
+		filters = append(filters,
+			key.Filter{Name: "Z", Required: key.ModCtrl},
+			key.Filter{Name: "Y", Required: key.ModCtrl},
+		)
+	}
+	if u.paletteOpen || u.newTableOpen || u.addColOpen || u.confirmEmptyTarget != "" || u.confirmDropName != "" {
+		filters = append(filters, key.Filter{Name: key.NameEscape})
+	}
 
 	// Global keyboard shortcuts.
 	for {
-		ev, ok := gtx.Event(
-			key.Filter{Name: "O", Required: key.ModCtrl, Optional: key.ModShift},
-			key.Filter{Name: "N", Required: key.ModCtrl},
-			key.Filter{Name: "B", Required: key.ModCtrl},
-			key.Filter{Name: "I", Required: key.ModCtrl},
-			key.Filter{Name: "S", Required: key.ModCtrl},
-			key.Filter{Name: "Z", Required: key.ModCtrl},
-			key.Filter{Name: "Y", Required: key.ModCtrl},
-			key.Filter{Name: "P", Required: key.ModCtrl, Optional: key.ModShift},
-			key.Filter{Name: key.NameReturn, Required: key.ModCtrl},
-			key.Filter{Name: key.NameEnter, Required: key.ModCtrl},
-			key.Filter{Name: key.NameF5},
-			key.Filter{Name: key.NameEscape},
-		)
+		ev, ok := gtx.Event(filters...)
 		if !ok {
 			break
 		}
@@ -643,6 +952,12 @@ func (u *uiState) layout(gtx layout.Context) layout.Dimensions {
 		case key.NameEscape:
 			if u.paletteOpen {
 				u.paletteOpen = false
+			} else {
+				u.addColOpen = false
+				u.newTableOpen = false
+				u.confirmEmptyTarget = ""
+				u.confirmDropName = ""
+				u.confirmDropType = ""
 			}
 		case key.NameReturn, key.NameEnter, key.NameF5:
 			if u.activeTab == tabSQL {
@@ -992,6 +1307,9 @@ func (u *uiState) layoutCommandPalette(gtx layout.Context) {
 		{"Export Current Table as CSV…", "", func() { u.exportBrowseTable(false) }},
 		{"Export Current Table as JSON…", "", func() { u.exportBrowseTable(true) }},
 		{"VACUUM INTO Compact Copy…", "", u.vacuumIntoDialog},
+		{"Import CSV / TSV into Table…", "", u.importCSVDialog},
+		{"Export Database Dump (.sql)…", "", u.exportSQLDialog},
+		{"Create New Table (Designer)…", "", u.openNewTableDesigner},
 		{"Load 100,000,000-Row Virtualized Demo", "", u.loadDemo100M},
 		{"Switch to Browse Data Tab", "", func() { u.activeTab = tabBrowse }},
 		{"Switch to Execute SQL Tab", "", func() { u.activeTab = tabSQL }},

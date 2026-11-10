@@ -91,3 +91,55 @@ func TestExportStaticCSVAndJSON(t *testing.T) {
 	}
 }
 
+func TestExportGridSourceSpoolCSVAndJSON(t *testing.T) {
+	sp, err := data.NewResultSpool([]data.Column{
+		{Name: "id", Type: "INTEGER"},
+		{Name: "label", Type: "TEXT"},
+		{Name: "val", Type: "REAL"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sp.Close()
+
+	if err := sp.AppendRowValues(
+		[]data.Kind{data.KindInteger, data.KindText, data.KindReal},
+		[][]byte{[]byte("7"), []byte(`spooled, "row"`), []byte("3.5")},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.AppendRowValues(
+		[]data.Kind{data.KindInteger, data.KindNull, data.KindNull},
+		[][]byte{[]byte("8"), nil, nil},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.Finish(); err != nil {
+		t.Fatal(err)
+	}
+
+	var csvBuf bytes.Buffer
+	n, err := ExportGridSourceCSV(sp, &csvBuf)
+	if err != nil || n != 2 {
+		t.Fatalf("ExportGridSourceCSV(ResultSpool) failed: n=%d err=%v", n, err)
+	}
+	recs, err := csv.NewReader(&csvBuf).ReadAll()
+	if err != nil || len(recs) != 3 || recs[1][1] != `spooled, "row"` || recs[2][1] != "" {
+		t.Fatalf("unexpected spool csv: %+v err=%v", recs, err)
+	}
+
+	var jsonBuf bytes.Buffer
+	n, err = ExportGridSourceJSON(sp, &jsonBuf)
+	if err != nil || n != 2 {
+		t.Fatalf("ExportGridSourceJSON(ResultSpool) failed: n=%d err=%v", n, err)
+	}
+	var parsed []map[string]any
+	if err := json.Unmarshal(jsonBuf.Bytes(), &parsed); err != nil {
+		t.Fatalf("invalid spool json: %v\n%s", err, jsonBuf.String())
+	}
+	if len(parsed) != 2 || parsed[0]["id"] != float64(7) || parsed[0]["val"] != float64(3.5) || parsed[1]["label"] != nil {
+		t.Fatalf("unexpected spool json: %+v", parsed)
+	}
+}
+
+

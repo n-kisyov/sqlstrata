@@ -168,8 +168,25 @@ func ExportQueryJSON(ctx context.Context, db *sqlite3.Conn, sqlQuery string, w i
 	return rows, bw.Flush()
 }
 
+// GridSourceReader supplies tabular cells to streaming exporters. Both
+// data.StaticSource and data.ResultSpool satisfy this interface.
+type GridSourceReader interface {
+	Columns() []data.Column
+	RowCount() int64
+	Cell(row int64, col int) (text string, kind data.Kind, trunc bool, ok bool)
+}
+
 // ExportStaticCSV exports a loaded StaticSource (e.g. SQL editor results) as CSV.
 func ExportStaticCSV(src *data.StaticSource, w io.Writer) (int64, error) {
+	if src == nil {
+		return 0, nil
+	}
+	return ExportGridSourceCSV(src, w)
+}
+
+// ExportGridSourceCSV exports any GridSourceReader (StaticSource or ResultSpool)
+// to w as RFC-4180 CSV without loading all rows into RAM at once.
+func ExportGridSourceCSV(src GridSourceReader, w io.Writer) (int64, error) {
 	if src == nil {
 		return 0, nil
 	}
@@ -203,6 +220,16 @@ func ExportStaticCSV(src *data.StaticSource, w io.Writer) (int64, error) {
 
 // ExportStaticJSON exports a loaded StaticSource (e.g. SQL editor results) as JSON.
 func ExportStaticJSON(src *data.StaticSource, w io.Writer) (int64, error) {
+	if src == nil {
+		_, err := io.WriteString(w, "[]\n")
+		return 0, err
+	}
+	return ExportGridSourceJSON(src, w)
+}
+
+// ExportGridSourceJSON exports any GridSourceReader (StaticSource or ResultSpool)
+// to w as a streamed JSON array of objects.
+func ExportGridSourceJSON(src GridSourceReader, w io.Writer) (int64, error) {
 	if src == nil {
 		_, err := io.WriteString(w, "[]\n")
 		return 0, err

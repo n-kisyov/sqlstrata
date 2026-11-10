@@ -19,6 +19,7 @@ import (
 	"github.com/ncruces/go-sqlite3"
 
 	"github.com/sqlstrata/sqlstrata/internal/data"
+	"github.com/sqlstrata/sqlstrata/internal/edit"
 	"github.com/sqlstrata/sqlstrata/internal/engine"
 )
 
@@ -162,6 +163,7 @@ func TestSelectIndexShowsStructure(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	ui.drainUI()
 
 	if ui.activeTab != tabStructure {
 		t.Fatalf("expected activeTab == tabStructure, got %v", ui.activeTab)
@@ -201,4 +203,254 @@ func TestSelectIndexShowsStructure(t *testing.T) {
 		t.Fatalf("expected 4-space indentation in DDL display, got:\n%s", ddl)
 	}
 }
+
+func TestExecuteSQLAndRunSQLFile(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	db, err := engine.Open(dbPath, engine.DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	ui := newUI(new(app.Window))
+	defer func() {
+		ui.mu.Lock()
+		sp := ui.sqlSpool
+		ui.sqlSpool = nil
+		ui.mu.Unlock()
+		if sp != nil {
+			_ = sp.Close()
+		}
+	}()
+	ui.db = db
+
+	waitSQL := func() {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			ui.drainUI()
+			ui.mu.Lock()
+			running := ui.sqlRunning
+			ui.mu.Unlock()
+			if !running {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("timed out waiting for SQL execution")
+	}
+
+	// 1. Multi-row query exceeding staticLimit (2000) should spill to ResultSpool.
+	ui.sqlEdit.SetText(`WITH RECURSIVE cnt(x) AS (
+		SELECT 1
+		UNION ALL
+		SELECT x + 1 FROM cnt WHERE x < 2105
+	)
+	SELECT x, 'row_' || x AS name FROM cnt;`)
+	ui.runSQL()
+	waitSQL()
+
+	ui.mu.Lock()
+	sp := ui.sqlSpool
+	status := ui.sqlStatus
+	ui.mu.Unlock()
+	if sp == nil || sp.RowCount() != 2105 {
+		t.Fatalf("expected 2105-row ResultSpool, got sp=%v status=%q", sp, status)
+	}
+	if got := ui.sqlGrid.Source(); got == nil || got.RowCount() != 2105 {
+		t.Fatalf("expected sqlGrid to hold 2105 spooled rows, got %v", got)
+	}
+
+	// 2. runSQLFile with PRAGMA + explicit BEGIN/COMMIT + trailing statement.
+	scriptPath := filepath.Join(dir, "seed.sql")
+	script := `PRAGMA foreign_keys = ON;
+CREATE TABLE script_items (id INTEGER PRIMARY KEY, name TEXT);
+BEGIN TRANSACTION;
+INSERT INTO script_items (id, name) VALUES (1, 'first');
+INSERT INTO script_items (id, name) VALUES (2, 'second');
+COMMIT;
+INSERT INTO script_items (id, name) VALUES (3, 'third');
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ui.runSQLFile(scriptPath)
+	waitSQL()
+
+	// Wait briefly for refreshSchemaAsync triggered by DDL.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		ui.drainUI()
+		ui.mu.Lock()
+		sc := ui.schema
+		ui.mu.Unlock()
+		if sc != nil && sc.Find("script_items") != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	ui.mu.Lock()
+	st := ui.sqlStatus
+	sc := ui.schema
+	ui.mu.Unlock()
+	if strings.HasPrefix(st, "Error") {
+		t.Fatalf("runSQLFile failed: %s", st)
+	}
+	if sc == nil || sc.Find("script_items") == nil {
+		t.Fatalf("expected schema to reload with script_items, status=%q", st)
+	}
+
+	var cnt int64
+	if err := db.Fg.Do(context.Background(), func(c *sqlite3.Conn) error {
+		s, _, err := c.Prepare("SELECT COUNT(*) FROM script_items")
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		if s.Step() {
+			cnt = s.ColumnInt64(0)
+		}
+		return s.Err()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 3 {
+		t.Fatalf("expected 3 rows inserted by runSQLFile, got %d", cnt)
+	}
+}
+
+func TestTableDesignerAndToolsWorkflow(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "designer.db")
+	db, err := engine.Open(dbPath, engine.DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	sz := image.Pt(1360, 840)
+	hw, err := headless.NewWindow(sz.X, sz.Y)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hw.Release()
+
+	ui := newUI(new(app.Window))
+	defer func() {
+		ui.mu.Lock()
+		src := ui.tableSrc
+		ui.tableSrc = nil
+		ui.mu.Unlock()
+		if src != nil {
+			src.Close()
+		}
+	}()
+	ui.db = db
+
+	waitCond := func(desc string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			ui.drainUI()
+			if cond() {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		ui.mu.Lock()
+		st := ui.statusMsg
+		ui.mu.Unlock()
+		t.Fatalf("timed out waiting for %s (status=%q)", desc, st)
+	}
+
+	// 1. Open New Table Designer & render headless frame.
+	ui.openNewTableDesigner()
+	ui.ntTableName.SetText("projects")
+	var ops op.Ops
+	gtx := layout.Context{
+		Ops:         &ops,
+		Metric:      unit.Metric{PxPerDp: 1, PxPerSp: 1},
+		Constraints: layout.Exact(sz),
+		Now:         time.Now(),
+	}
+	ui.layout(gtx)
+	if err := hw.Frame(&ops); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := ui.buildDesignerTableSpec()
+	ui.createTableFromDesigner(spec)
+	waitCond("projects table creation", func() bool {
+		ui.mu.Lock()
+		defer ui.mu.Unlock()
+		return ui.schema != nil && ui.schema.Find("projects") != nil && !ui.newTableOpen
+	})
+
+	// Seed a row, then add column triggering 12-step rebuild ((0.0) expression default).
+	if err := db.Fg.Do(context.Background(), func(c *sqlite3.Conn) error {
+		return c.Exec(`INSERT INTO projects (id, name) VALUES (1, 'Atlas');`)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ui.mu.Lock()
+	projObj := ui.schema.Find("projects")
+	ui.mu.Unlock()
+	ui.applyAddColumn(projObj, edit.ColumnDef{
+		Name:       "budget",
+		Type:       "REAL",
+		NotNull:    true,
+		Default:    "(0.0)",
+		HasDefault: true,
+	}, nil)
+	waitCond("projects budget column via 12-step rebuild", func() bool {
+		ui.mu.Lock()
+		defer ui.mu.Unlock()
+		o := ui.schema.Find("projects")
+		return o != nil && len(o.Columns) == 3
+	})
+
+	// 2. Import CSV & Dump SQL via UI helpers.
+	csvPath := filepath.Join(dir, "metrics.csv")
+	if err := os.WriteFile(csvPath, []byte("day,hits\n2026-01-01,100\n2026-01-02,250\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ui.importCSVFile(csvPath)
+	waitCond("imported metrics CSV table", func() bool {
+		ui.mu.Lock()
+		defer ui.mu.Unlock()
+		return ui.schema != nil && ui.schema.Find("metrics") != nil
+	})
+
+	dumpPath := filepath.Join(dir, "backup.sql")
+	ui.exportSQLDump(dumpPath)
+	rawDump, err := os.ReadFile(dumpPath)
+	if err != nil {
+		t.Fatalf("read exported dump failed: %v", err)
+	}
+	if !strings.Contains(string(rawDump), `CREATE TABLE "projects"`) || !strings.Contains(string(rawDump), "'Atlas'") {
+		t.Fatalf("unexpected SQL dump contents:\n%s", string(rawDump))
+	}
+
+	// 3. Empty & Drop projects table.
+	ui.mu.Lock()
+	projObj2 := ui.schema.Find("projects")
+	ui.mu.Unlock()
+	ui.emptyTableObject(projObj2)
+	waitCond("empty projects table", func() bool {
+		ui.mu.Lock()
+		defer ui.mu.Unlock()
+		return strings.Contains(ui.statusMsg, "Emptied")
+	})
+	ui.dropSchemaObject(projObj2)
+	waitCond("drop projects table", func() bool {
+		ui.mu.Lock()
+		defer ui.mu.Unlock()
+		return ui.schema != nil && ui.schema.Find("projects") == nil
+	})
+}
+
+
 

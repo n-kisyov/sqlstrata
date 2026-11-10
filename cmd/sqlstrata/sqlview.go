@@ -26,6 +26,7 @@ import (
 	"github.com/sqlstrata/sqlstrata/internal/platform/win"
 	"github.com/sqlstrata/sqlstrata/internal/sqltok"
 	"github.com/sqlstrata/sqlstrata/internal/ui/theme"
+	"github.com/sqlstrata/sqlstrata/internal/ui/widgets"
 )
 
 func (u *uiState) runSQL() {
@@ -57,12 +58,14 @@ func (u *uiState) runSQL() {
 	stmts := sqltok.SplitStatements(sqlText)
 	go func() {
 		start := time.Now()
-		var res *data.StaticSource
+		var resGrid widgets.GridSource
+		var resSpool *data.ResultSpool
 		var rowsRead int64
 		var affected int64
 		var stmtsRun int
 		var schemaDirty bool
-		const rowCap = 10_000
+		const staticLimit = 2_000
+		const spoolCap = 500_000
 
 		err := db.Fg.Do(ctx, func(c *sqlite3.Conn) error {
 			for _, st := range stmts {
@@ -95,71 +98,152 @@ func (u *uiState) runSQL() {
 						Type: stmt.ColumnDeclType(i),
 					}
 				}
-				cur := data.NewStaticSource(cols)
+				curStatic := data.NewStaticSource(cols)
+				var curSpool *data.ResultSpool
 				var curRows int64
 				for stmt.Step() {
-					for i := range ncols {
-						switch stmt.ColumnType(i) {
-						case sqlite3.NULL:
-							cur.AppendCell(nil, data.KindNull)
-						case sqlite3.INTEGER:
-							cur.AppendCell(stmt.ColumnRawText(i), data.KindInteger)
-						case sqlite3.FLOAT:
-							cur.AppendCell(stmt.ColumnRawText(i), data.KindReal)
-						case sqlite3.TEXT:
-							v := stmt.ColumnRawText(i)
-							if len(v) > data.PreviewBytes {
-								v = v[:data.PreviewBytes]
+					if curSpool == nil && curRows < staticLimit {
+						for i := range ncols {
+							switch stmt.ColumnType(i) {
+							case sqlite3.NULL:
+								curStatic.AppendCell(nil, data.KindNull)
+							case sqlite3.INTEGER:
+								curStatic.AppendCell(stmt.ColumnRawText(i), data.KindInteger)
+							case sqlite3.FLOAT:
+								curStatic.AppendCell(stmt.ColumnRawText(i), data.KindReal)
+							case sqlite3.TEXT:
+								v := stmt.ColumnRawText(i)
+								if len(v) > data.PreviewBytes {
+									v = v[:data.PreviewBytes]
+								}
+								curStatic.AppendCell(v, data.KindText)
+							case sqlite3.BLOB:
+								msg := "BLOB " + data.FormatSize(int64(len(stmt.ColumnRawBlob(i))))
+								curStatic.AppendCell([]byte(msg), data.KindBlob)
 							}
-							cur.AppendCell(v, data.KindText)
-						case sqlite3.BLOB:
-							msg := "BLOB " + data.FormatSize(int64(len(stmt.ColumnRawBlob(i))))
-							cur.AppendCell([]byte(msg), data.KindBlob)
+						}
+					} else {
+						if curSpool == nil {
+							sp, serr := spillStaticToSpool(cols, curStatic)
+							if serr != nil {
+								_ = stmt.Close()
+								return serr
+							}
+							curSpool = sp
+							curStatic = nil
+						}
+						if err := curSpool.AppendRowFromStmt(stmt); err != nil {
+							_ = curSpool.Close()
+							_ = stmt.Close()
+							return err
 						}
 					}
 					curRows++
-					if curRows >= rowCap {
+					if curRows >= spoolCap {
 						break
 					}
 				}
 				serr := stmt.Err()
 				_ = stmt.Close()
 				if serr != nil {
+					if curSpool != nil {
+						_ = curSpool.Close()
+					}
 					return fmt.Errorf("line %d: %w", st.StartLine, serr)
 				}
-				res = cur
+				if resSpool != nil {
+					_ = resSpool.Close()
+					resSpool = nil
+				}
+				if curSpool != nil {
+					if err := curSpool.Finish(); err != nil {
+						_ = curSpool.Close()
+						return err
+					}
+					resSpool = curSpool
+					resGrid = curSpool
+				} else {
+					resGrid = curStatic
+				}
 				rowsRead = curRows
 			}
 			return nil
 		})
 		cancel()
 
+		if err != nil && resSpool != nil {
+			_ = resSpool.Close()
+			resSpool = nil
+		}
+
 		if err == nil && schemaDirty {
 			u.refreshSchemaAsync(db)
 		}
 
-		u.mu.Lock()
-		u.sqlRunning = false
-		u.sqlCancel = nil
-		if err != nil {
-			u.sqlStatus = fmt.Sprintf("Error: %v", err)
-		} else if res != nil {
-			suffix := ""
-			if rowsRead >= rowCap {
-				suffix = fmt.Sprintf(" (capped at %d rows)", rowCap)
+		u.postUI(func() {
+			u.mu.Lock()
+			u.sqlRunning = false
+			u.sqlCancel = nil
+			src := u.tableSrc
+			if err != nil {
+				u.sqlStatus = fmt.Sprintf("Error: %v", err)
+				u.mu.Unlock()
+				return
 			}
-			if stmtsRun > 1 {
-				u.sqlStatus = fmt.Sprintf("%d statements · %d rows in %s%s", stmtsRun, rowsRead, time.Since(start).Round(time.Microsecond), suffix)
+			if resGrid != nil {
+				oldSpool := u.sqlSpool
+				u.sqlSpool = resSpool
+				suffix := ""
+				if rowsRead >= spoolCap {
+					suffix = fmt.Sprintf(" (spooled, capped at %d rows)", spoolCap)
+				} else if resSpool != nil {
+					suffix = " (spooled to disk)"
+				}
+				if stmtsRun > 1 {
+					u.sqlStatus = fmt.Sprintf("%d statements · %d rows in %s%s", stmtsRun, rowsRead, time.Since(start).Round(time.Microsecond), suffix)
+				} else {
+					u.sqlStatus = fmt.Sprintf("%d rows in %s%s", rowsRead, time.Since(start).Round(time.Microsecond), suffix)
+				}
+				u.mu.Unlock()
+				u.sqlGrid.SetSource(resGrid)
+				if oldSpool != nil && oldSpool != resSpool {
+					_ = oldSpool.Close()
+				}
 			} else {
-				u.sqlStatus = fmt.Sprintf("%d rows in %s%s", rowsRead, time.Since(start).Round(time.Microsecond), suffix)
+				u.sqlStatus = fmt.Sprintf("%d statement(s), %d row(s) affected in %s", max(1, stmtsRun), affected, time.Since(start).Round(time.Microsecond))
+				u.mu.Unlock()
 			}
-			u.sqlGrid.SetSource(res)
-		} else {
-			u.sqlStatus = fmt.Sprintf("%d statement(s), %d row(s) affected in %s", max(1, stmtsRun), affected, time.Since(start).Round(time.Microsecond))
-		}
-		u.mu.Unlock()
-		u.win.Invalidate()
+			if (affected > 0 || schemaDirty) && src != nil {
+				src.Reload()
+			}
+		})
 	}()
+}
+
+func spillStaticToSpool(cols []data.Column, st *data.StaticSource) (*data.ResultSpool, error) {
+	sp, err := data.NewResultSpool(cols)
+	if err != nil {
+		return nil, err
+	}
+	nrows := st.RowCount()
+	kinds := make([]data.Kind, len(cols))
+	vals := make([][]byte, len(cols))
+	for r := int64(0); r < nrows; r++ {
+		for c := range cols {
+			txt, k, _, _ := st.Cell(r, c)
+			kinds[c] = k
+			if k == data.KindNull {
+				vals[c] = nil
+			} else {
+				vals[c] = []byte(txt)
+			}
+		}
+		if err := sp.AppendRowValues(kinds, vals); err != nil {
+			_ = sp.Close()
+			return nil, err
+		}
+	}
+	return sp, nil
 }
 
 func (u *uiState) runSQLFileDialog() {
@@ -209,20 +293,47 @@ func (u *uiState) runSQLFile(path string) {
 		if err == nil {
 			defer f.Close()
 			err = db.Fg.Do(ctx, func(c *sqlite3.Conn) error {
-				if err := c.Exec("BEGIN IMMEDIATE"); err != nil {
-					return err
-				}
+				batchTx := false
 				rollback := func(rerr error) error {
-					_ = c.Exec("ROLLBACK")
+					if !c.GetAutocommit() {
+						_ = c.Exec("ROLLBACK")
+					}
 					return rerr
 				}
 				serr := sqltok.StreamStatements(f, func(st sqltok.Statement) error {
 					if ctx.Err() != nil {
 						return ctx.Err()
 					}
+					kw := firstKeywordUpper(st.SQL)
 					if isDDLStatement(st.SQL) {
 						schemaDirty = true
 					}
+					switch kw {
+					case "BEGIN":
+						if batchTx {
+							if cerr := c.Exec("COMMIT"); cerr != nil {
+								return cerr
+							}
+							batchTx = false
+						}
+					case "PRAGMA", "VACUUM", "ATTACH", "DETACH":
+						if batchTx {
+							if cerr := c.Exec("COMMIT"); cerr != nil {
+								return cerr
+							}
+							batchTx = false
+						}
+					case "COMMIT", "END", "ROLLBACK":
+						// Executed directly below.
+					default:
+						if c.GetAutocommit() {
+							if berr := c.Exec("BEGIN IMMEDIATE"); berr != nil {
+								return berr
+							}
+							batchTx = true
+						}
+					}
+
 					stmt, _, perr := c.Prepare(st.SQL)
 					if perr != nil {
 						return fmt.Errorf("line %d: %w", st.StartLine, perr)
@@ -234,6 +345,9 @@ func (u *uiState) runSQLFile(path string) {
 					_ = stmt.Close()
 					if err != nil {
 						return fmt.Errorf("line %d: %w", st.StartLine, err)
+					}
+					if c.GetAutocommit() {
+						batchTx = false
 					}
 					stmtsRun++
 					if stmtsRun%500 == 0 {
@@ -247,8 +361,10 @@ func (u *uiState) runSQLFile(path string) {
 				if serr != nil {
 					return rollback(serr)
 				}
-				if err := c.Exec("COMMIT"); err != nil {
-					return rollback(err)
+				if batchTx && !c.GetAutocommit() {
+					if err := c.Exec("COMMIT"); err != nil {
+						return rollback(err)
+					}
 				}
 				return nil
 			})
@@ -259,32 +375,42 @@ func (u *uiState) runSQLFile(path string) {
 			u.refreshSchemaAsync(db)
 		}
 
-		u.mu.Lock()
-		u.sqlRunning = false
-		u.sqlCancel = nil
-		if err != nil {
-			u.sqlStatus = fmt.Sprintf("Script error: %v", err)
-		} else {
-			u.sqlStatus = fmt.Sprintf("Executed %s: %d statement(s) in %s", filepath.Base(path), stmtsRun, time.Since(start).Round(time.Millisecond))
-		}
-		u.mu.Unlock()
-		u.win.Invalidate()
+		u.postUI(func() {
+			u.mu.Lock()
+			u.sqlRunning = false
+			u.sqlCancel = nil
+			src := u.tableSrc
+			if err != nil {
+				u.sqlStatus = fmt.Sprintf("Script error: %v", err)
+			} else {
+				u.sqlStatus = fmt.Sprintf("Executed %s: %d statement(s) in %s", filepath.Base(path), stmtsRun, time.Since(start).Round(time.Millisecond))
+			}
+			u.mu.Unlock()
+			if err == nil && src != nil {
+				src.Reload()
+			}
+		})
 	}()
 }
 
-func isDDLStatement(sql string) bool {
+func firstKeywordUpper(sql string) string {
 	toks := sqltok.Tokenize(sql)
 	for _, tk := range toks {
 		if tk.Kind == sqltok.TokenWhitespace || tk.Kind == sqltok.TokenComment {
 			continue
 		}
 		if tk.Kind == sqltok.TokenKeyword {
-			switch strings.ToUpper(tk.Text(sql)) {
-			case "CREATE", "ALTER", "DROP", "VACUUM", "ATTACH", "DETACH", "REINDEX":
-				return true
-			}
+			return strings.ToUpper(tk.Text(sql))
 		}
-		return false
+		return ""
+	}
+	return ""
+}
+
+func isDDLStatement(sql string) bool {
+	switch firstKeywordUpper(sql) {
+	case "CREATE", "ALTER", "DROP", "VACUUM", "ATTACH", "DETACH", "REINDEX":
+		return true
 	}
 	return false
 }
@@ -302,23 +428,24 @@ func (u *uiState) refreshSchemaAsync(db *engine.DB) {
 	if err != nil {
 		return
 	}
-	u.mu.Lock()
-	sameDB := u.db == db
-	if sameDB {
-		u.schema = schema
-		if fi, serr := os.Stat(db.Path); serr == nil {
-			u.dbSize = fi.Size()
+	u.postUI(func() {
+		u.mu.Lock()
+		sameDB := u.db == db
+		if sameDB {
+			u.schema = schema
+			if fi, serr := os.Stat(db.Path); serr == nil {
+				u.dbSize = fi.Size()
+			}
 		}
-	}
-	u.mu.Unlock()
-	if sameDB {
-		u.tree.SetSchema(schema)
-		u.win.Invalidate()
-	}
+		u.mu.Unlock()
+		if sameDB {
+			u.tree.SetSchema(schema)
+		}
+	})
 }
 
 func (u *uiState) exportSQLResults(asJSON bool) {
-	src, ok := u.sqlGrid.Source().(*data.StaticSource)
+	src, ok := u.sqlGrid.Source().(iofmt.GridSourceReader)
 	if !ok || src == nil || src.RowCount() == 0 {
 		u.setStatus("Run a query with result rows first before exporting")
 		return
@@ -343,9 +470,9 @@ func (u *uiState) exportSQLResults(asJSON bool) {
 		}
 		var n int64
 		if asJSON {
-			n, err = iofmt.ExportStaticJSON(src, f)
+			n, err = iofmt.ExportGridSourceJSON(src, f)
 		} else {
-			n, err = iofmt.ExportStaticCSV(src, f)
+			n, err = iofmt.ExportGridSourceCSV(src, f)
 		}
 		if cerr := f.Close(); err == nil {
 			err = cerr
