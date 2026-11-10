@@ -1,10 +1,12 @@
 package data
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand/v2"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -296,5 +298,134 @@ func TestTableSourceSortFilterAndStagedEdit(t *testing.T) {
 	got, _ = loadCell(t, src, ch, 0, 1)
 	if got != "updated_name" {
 		t.Fatalf("staged cell = %q, want updated_name", got)
+	}
+}
+
+func TestTableSourceTruncatedEditOpenBlobAndDescAnchors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "long.db")
+	dbConn, err := sqlite3.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbConn.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT, payload BLOB);`); err != nil {
+		t.Fatal(err)
+	}
+	longBody := strings.Repeat("abcdef0123456789", 40) // 640 bytes (> PreviewBytes=256)
+	blobData := make([]byte, 8192)
+	for i := range blobData {
+		blobData[i] = byte(i)
+	}
+	stmt, _, err := dbConn.Prepare(`INSERT INTO docs VALUES (?, ?, ?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := int64(-2); i < 3000; i++ {
+		if i == 0 || i < 0 || i%2 == 0 {
+			_ = stmt.BindInt64(1, i)
+			if i == -2 {
+				_ = stmt.BindText(2, longBody)
+				_ = stmt.BindBlob(3, blobData)
+			} else {
+				_ = stmt.BindText(2, fmt.Sprintf("body_%d", i))
+				_ = stmt.BindNull(3)
+			}
+			if err := stmt.Exec(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	stmt.Close()
+	dbConn.Close()
+
+	db, err := engine.Open(path, engine.DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var schema *engine.Schema
+	if err := db.Fg.Do(t.Context(), func(c *sqlite3.Conn) error {
+		schema, err = engine.LoadSchema(c)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ch := make(chan struct{}, 1)
+	src := NewTableSource(db, schema.Find("docs"), SourceOptions{CacheBudget: 32 << 20}, func() {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	})
+	defer src.Close()
+
+	n := waitExact(t, src, ch)
+	if n < 1500 {
+		t.Fatalf("unexpected row count: %d", n)
+	}
+
+	// Row 0 has rowid = -2 and 640-byte truncated body.
+	txt, kind, trunc, ok := func() (string, Kind, bool, bool) {
+		loadCell(t, src, ch, 0, 1)
+		return src.Cell(0, 1)
+	}()
+	if !ok || kind != KindText || !trunc || len(txt) != PreviewBytes {
+		t.Fatalf("expected truncated 256B preview, got len=%d trunc=%v ok=%v", len(txt), trunc, ok)
+	}
+	// Truncated StageCellEdit without fullOrig must fail rather than creating a broken guard.
+	if src.StageCellEdit(0, 1, edit.TextValue("new short")) {
+		t.Fatal("StageCellEdit should refuse truncated cell without full original")
+	}
+
+	// Fetch full detail and stage edit with full original.
+	detCh := make(chan CellDetail, 1)
+	src.FetchCellDetail(0, 1, 256*1024, func(det CellDetail, err error) {
+		if err != nil {
+			t.Errorf("FetchCellDetail err: %v", err)
+		}
+		detCh <- det
+	})
+	det := <-detCh
+	if det.Truncated || string(det.Data) != longBody {
+		t.Fatalf("expected full 640B body, got len=%d trunc=%v", len(det.Data), det.Truncated)
+	}
+	origVal := edit.ExactValue(edit.KindText, string(det.Data), nil)
+	if !src.StageCellEditWithOrig(0, 1, origVal, true, edit.TextValue("clean update on neg rowid")) {
+		t.Fatal("StageCellEditWithOrig failed")
+	}
+	if err := db.Fg.Do(t.Context(), func(c *sqlite3.Conn) error {
+		return src.Changes().Apply(c)
+	}); err != nil {
+		t.Fatalf("Apply failed on >256B text / negative rowid: %v", err)
+	}
+
+	// Test incremental OpenBlob at offset 2048.
+	detCh2 := make(chan CellDetail, 1)
+	src.FetchCellDetailAt(0, 2, 2048, 1024, func(det CellDetail, err error) {
+		if err != nil {
+			t.Errorf("FetchCellDetailAt err: %v", err)
+		}
+		detCh2 <- det
+	})
+	bdet := <-detCh2
+	if bdet.Kind != KindBlob || bdet.TotalBytes != 8192 || len(bdet.Data) != 1024 || !bytes.Equal(bdet.Data, blobData[2048:3072]) {
+		t.Fatalf("OpenBlob window mismatch: kind=%v total=%d len=%d", bdet.Kind, bdet.TotalBytes, len(bdet.Data))
+	}
+
+	// Verify bare SQL keyword filter ("in") searches text instead of syntax error.
+	src.SetFilter("in")
+	_ = waitExact(t, src, ch)
+	if err := src.Err(); err != nil {
+		t.Fatalf("bare word filter 'in' triggered SQL error: %v", err)
+	}
+	src.SetFilter("")
+	_ = waitExact(t, src, ch)
+
+	// Verify DESC sort random jump uses reverse anchors cleanly.
+	src.SetSort(0, true)
+	descMid, _ := loadCell(t, src, ch, 1200, 0)
+	// Row 1200 descending in ~1502 rows -> should be strictly lower than max rowid.
+	descVal, err := strconv.ParseInt(descMid, 10, 64)
+	if err != nil || descVal >= 2000 || descVal < 0 {
+		t.Fatalf("unexpected desc sort anchor value at row 1200: %q (err=%v)", descMid, err)
 	}
 }

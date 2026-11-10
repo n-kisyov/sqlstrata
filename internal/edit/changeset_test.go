@@ -23,7 +23,7 @@ func TestChangeSetUndoRedoAndPreview(t *testing.T) {
 	}
 
 	// Stage cell edit on rowid 10, col 1 ("name").
-	cs.SetCell(10, 1, TextValue("Alice"), TextValue("Alicia"))
+	cs.SetCell(10, 1, ExactValue(KindText, "Alice", nil), TextValue("Alicia"))
 	if !cs.HasChanges() || cs.Count() != 1 {
 		t.Fatalf("expected 1 change, got %d", cs.Count())
 	}
@@ -61,7 +61,7 @@ func TestChangeSetUndoRedoAndPreview(t *testing.T) {
 	}
 }
 
-func TestChangeSetApplyAndConflict(t *testing.T) {
+func TestChangeSetApplyNegativeRowidAndInsertedRowUndo(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "edit.db")
 	db, err := sqlite3.Open(path)
 	if err != nil {
@@ -75,7 +75,7 @@ func TestChangeSetApplyAndConflict(t *testing.T) {
 			title TEXT NOT NULL,
 			price REAL
 		);
-		INSERT INTO items VALUES (1, 'Keyboard', 99.5), (2, 'Mouse', 49.0);
+		INSERT INTO items VALUES (-5, 'Legacy Neg', 12.5), (0, 'Zero Row', '007'), (1, 'Keyboard', 99.5), (2, 'Mouse', 49.0);
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -87,13 +87,36 @@ func TestChangeSetApplyAndConflict(t *testing.T) {
 	obj := schema.Find("items")
 	cs := NewChangeSet(obj.Name, obj.Columns)
 
-	// 1. Update row 1, delete row 2, insert a new row.
-	cs.SetCell(1, 1, TextValue("Keyboard"), TextValue("Mech Keyboard"))
-	cs.SetCell(1, 2, TextValue("99.5"), TextValue("129.0"))
+	// 1. Update negative rowid (-5), update rowid 0 holding text '007' in REAL column,
+	// delete row 2, insert a new row and exercise undo/redo on the inserted row!
+	cs.SetCell(-5, 1, ExactValue(KindText, "Legacy Neg", nil), TextValue("Updated Neg"))
+	cs.SetCell(0, 2, ExactValue(KindText, "007", nil), TextValue("15.25"))
+	cs.SetCell(1, 1, ExactValue(KindText, "Keyboard", nil), TextValue("Mech Keyboard"))
+	cs.SetCell(1, 2, ExactValue(KindReal, "99.5", nil), TextValue("129.0"))
 	cs.ToggleDelete(2)
+
 	insID := cs.InsertRow()
-	cs.SetCell(insID, 1, NullValue(), TextValue("Monitor"))
-	cs.SetCell(insID, 2, NullValue(), TextValue("299.99"))
+	insKey := RowKey{ID: insID, Inserted: true}
+	cs.SetCellKey(insKey, 1, NullValue(), TextValue("Monitor"))
+	cs.SetCellKey(insKey, 2, NullValue(), TextValue("299.99"))
+
+	// Undo inserted cell edit, then redo it; toggle-delete inserted row, then undo deletion.
+	if !cs.Undo() {
+		t.Fatal("expected undo on inserted cell")
+	}
+	if v, _, _ := cs.LookupKey(insKey, 2); !v.Null {
+		t.Fatalf("expected reverted price to NULL, got %+v", v)
+	}
+	if !cs.Redo() {
+		t.Fatal("expected redo on inserted cell")
+	}
+	cs.ToggleDeleteKey(insKey)
+	if len(cs.Inserts()) != 0 {
+		t.Fatalf("expected deleted staged insert to disappear, got %d", len(cs.Inserts()))
+	}
+	if !cs.Undo() || len(cs.Inserts()) != 1 {
+		t.Fatalf("expected undo of deleted staged insert to restore row")
+	}
 
 	if err := cs.Apply(db); err != nil {
 		t.Fatalf("Apply failed: %v", err)
@@ -117,16 +140,17 @@ func TestChangeSetApplyAndConflict(t *testing.T) {
 	for stmt.Step() {
 		got = append(got, row{stmt.ColumnInt64(0), stmt.ColumnText(1), stmt.ColumnFloat(2)})
 	}
-	if len(got) != 2 || got[0].title != "Mech Keyboard" || got[0].price != 129.0 || got[1].title != "Monitor" {
+	if len(got) != 4 || got[0].id != -5 || got[0].title != "Updated Neg" ||
+		got[1].id != 0 || got[1].price != 15.25 ||
+		got[2].title != "Mech Keyboard" || got[3].title != "Monitor" {
 		t.Fatalf("unexpected rows after Apply: %+v", got)
 	}
 
 	// 2. Test optimistic concurrency conflict detection: stage an update with a
 	// stale original value and verify Apply rolls back and reports a conflict.
-	cs.SetCell(1, 1, TextValue("Stale Value"), TextValue("Should Fail"))
+	cs.SetCell(1, 1, ExactValue(KindText, "Stale Value", nil), TextValue("Should Fail"))
 	err = cs.Apply(db)
 	if err == nil || !strings.Contains(err.Error(), "conflict") {
 		t.Fatalf("expected concurrency conflict error, got: %v", err)
 	}
 }
-

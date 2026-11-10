@@ -14,18 +14,49 @@ import (
 	"github.com/sqlstrata/sqlstrata/internal/engine"
 )
 
+// ValueKind identifies the explicit SQLite storage class of a Value.
+type ValueKind uint8
+
+const (
+	KindAuto ValueKind = iota // coerce using column declared type
+	KindNull
+	KindInt
+	KindReal
+	KindText
+	KindBlob
+)
+
+// RowKey uniquely identifies either an existing database row (Inserted == false,
+// where ID is the SQLite rowid, which may be negative, zero, or positive) or
+// a staged inserted row (Inserted == true, where ID is an allocator sequence).
+type RowKey struct {
+	ID       int64
+	Inserted bool
+}
+
 // Value represents a literal SQL cell value in a staged edit.
 type Value struct {
 	Null bool
+	Kind ValueKind
 	Text string // raw text representation (numbers, strings, or hex for blobs)
-	Blob []byte // non-nil only when setting a binary blob
+	Blob []byte // non-nil when Kind == KindBlob or Blob != nil
 }
 
 // NullValue returns a NULL Value.
-func NullValue() Value { return Value{Null: true} }
+func NullValue() Value { return Value{Null: true, Kind: KindNull} }
 
-// TextValue returns a non-null text/numeric Value.
+// TextValue returns a Value whose literal coercion follows the column's
+// declared type (or TEXT if non-numeric).
 func TextValue(s string) Value { return Value{Text: s} }
+
+// ExactValue returns a Value preserving an exact SQLite storage class for
+// optimistic concurrency comparisons.
+func ExactValue(kind ValueKind, s string, blob []byte) Value {
+	if kind == KindNull {
+		return NullValue()
+	}
+	return Value{Kind: kind, Text: s, Blob: blob}
+}
 
 // CellEdit records the original and new value of a single cell on an existing row.
 type CellEdit struct {
@@ -36,7 +67,7 @@ type CellEdit struct {
 
 // NewRow represents a staged INSERT row.
 type NewRow struct {
-	ID     int64 // temporary negative ID (-1, -2, ...)
+	ID     int64
 	Values map[int]Value
 }
 
@@ -47,15 +78,20 @@ const (
 	opDeleteRow
 	opUndeleteRow
 	opInsertRow
+	opUpdateInsertCell
+	opDeleteInsertRow
 )
 
 type undoEntry struct {
 	kind    opKind
-	rowid   int64
+	key     RowKey
 	col     int
 	hadPrev bool
+	prevVal Value
+	newVal  Value
 	prev    CellEdit
 	next    CellEdit
+	insIdx  int
 	newRow  NewRow
 }
 
@@ -79,7 +115,7 @@ func NewChangeSet(table string, cols []engine.Column) *ChangeSet {
 		cols:    cols,
 		updates: map[int64]map[int]CellEdit{},
 		deletes: map[int64]bool{},
-		nextID:  -1,
+		nextID:  1,
 	}
 }
 
@@ -112,23 +148,37 @@ func (cs *ChangeSet) Clear() {
 	cs.redo = nil
 }
 
-// SetCell stages an update to (rowid, col). If rowid < 0, it updates the
-// corresponding staged inserted row.
+// SetCell stages an update to existing database rowid and col.
 func (cs *ChangeSet) SetCell(rowid int64, col int, orig, val Value) {
+	cs.SetCellKey(RowKey{ID: rowid}, col, orig, val)
+}
+
+// SetCellKey stages an update to key (existing DB row or staged insert row).
+func (cs *ChangeSet) SetCellKey(key RowKey, col int, orig, val Value) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	if rowid < 0 {
+	if key.Inserted {
 		for i := range cs.inserts {
-			if cs.inserts[i].ID == rowid {
+			if cs.inserts[i].ID == key.ID {
+				prevVal, hadPrev := cs.inserts[i].Values[col]
 				cs.inserts[i].Values[col] = val
+				cs.undo = append(cs.undo, undoEntry{
+					kind:    opUpdateInsertCell,
+					key:     key,
+					col:     col,
+					hadPrev: hadPrev,
+					prevVal: prevVal,
+					newVal:  val,
+				})
+				cs.redo = nil
 				return
 			}
 		}
 		return
 	}
 
-	rowMap := cs.updates[rowid]
+	rowMap := cs.updates[key.ID]
 	prev, hadPrev := rowMap[col]
 	if hadPrev {
 		orig = prev.Orig
@@ -137,18 +187,18 @@ func (cs *ChangeSet) SetCell(rowid int64, col int, orig, val Value) {
 
 	cs.undo = append(cs.undo, undoEntry{
 		kind:    opUpdateCell,
-		rowid:   rowid,
+		key:     key,
 		col:     col,
 		hadPrev: hadPrev,
 		prev:    prev,
 		next:    next,
 	})
 	cs.redo = nil
-	cs.applyCellLocked(rowid, col, orig, val)
+	cs.applyCellLocked(key.ID, col, orig, val)
 }
 
 func (cs *ChangeSet) applyCellLocked(rowid int64, col int, orig, val Value) {
-	if orig.Null == val.Null && orig.Text == val.Text && string(orig.Blob) == string(val.Blob) {
+	if valuesEqual(orig, val) {
 		if m := cs.updates[rowid]; m != nil {
 			delete(m, col)
 			if len(m) == 0 {
@@ -165,49 +215,91 @@ func (cs *ChangeSet) applyCellLocked(rowid int64, col int, orig, val Value) {
 	m[col] = CellEdit{Col: col, Orig: orig, New: val}
 }
 
-// ToggleDelete marks or unmarks rowid for deletion. If rowid < 0, it removes
-// the staged inserted row.
+func valuesEqual(a, b Value) bool {
+	if a.Null || b.Null {
+		return a.Null && b.Null
+	}
+	if a.Kind == KindBlob || b.Kind == KindBlob {
+		return a.Kind == b.Kind && string(a.Blob) == string(b.Blob)
+	}
+	if a.Kind != KindAuto && b.Kind != KindAuto && a.Kind != b.Kind {
+		return false
+	}
+	return a.Text == b.Text && string(a.Blob) == string(b.Blob)
+}
+
+// ToggleDelete marks or unmarks existing database rowid for deletion.
 func (cs *ChangeSet) ToggleDelete(rowid int64) {
+	cs.ToggleDeleteKey(RowKey{ID: rowid})
+}
+
+// ToggleDeleteKey marks or unmarks key for deletion (removing staged inserts
+// with full undo support).
+func (cs *ChangeSet) ToggleDeleteKey(key RowKey) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	if rowid < 0 {
+	if key.Inserted {
 		for i := range cs.inserts {
-			if cs.inserts[i].ID == rowid {
+			if cs.inserts[i].ID == key.ID {
+				snap := cloneNewRow(cs.inserts[i])
 				cs.inserts = slices.Delete(cs.inserts, i, i+1)
+				cs.undo = append(cs.undo, undoEntry{
+					kind:   opDeleteInsertRow,
+					key:    key,
+					insIdx: i,
+					newRow: snap,
+				})
+				cs.redo = nil
 				return
 			}
 		}
 		return
 	}
-	if cs.deletes[rowid] {
-		delete(cs.deletes, rowid)
-		cs.undo = append(cs.undo, undoEntry{kind: opUndeleteRow, rowid: rowid})
+	if cs.deletes[key.ID] {
+		delete(cs.deletes, key.ID)
+		cs.undo = append(cs.undo, undoEntry{kind: opUndeleteRow, key: key})
 	} else {
-		cs.deletes[rowid] = true
-		cs.undo = append(cs.undo, undoEntry{kind: opDeleteRow, rowid: rowid})
+		cs.deletes[key.ID] = true
+		cs.undo = append(cs.undo, undoEntry{kind: opDeleteRow, key: key})
 	}
 	cs.redo = nil
 }
 
-// InsertRow stages a new blank row and returns its temporary negative ID.
+// InsertRow stages a new blank row and returns its RowKey.
 func (cs *ChangeSet) InsertRow() int64 {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	id := cs.nextID
-	cs.nextID--
+	cs.nextID++
 	nr := NewRow{ID: id, Values: map[int]Value{}}
 	for i, c := range cs.cols {
-		if !c.NotNull || c.HasDflt || c.PK > 0 {
+		if !c.NotNull || c.HasDflt || (c.PK > 0 && strings.EqualFold(c.Type, "INTEGER")) {
 			nr.Values[i] = NullValue()
 		} else {
 			nr.Values[i] = TextValue("")
 		}
 	}
 	cs.inserts = append(cs.inserts, nr)
-	cs.undo = append(cs.undo, undoEntry{kind: opInsertRow, rowid: id, newRow: nr})
+	cs.undo = append(cs.undo, undoEntry{
+		kind:   opInsertRow,
+		key:    RowKey{ID: id, Inserted: true},
+		insIdx: len(cs.inserts) - 1,
+		newRow: cloneNewRow(nr),
+	})
 	cs.redo = nil
 	return id
+}
+
+func cloneNewRow(nr NewRow) NewRow {
+	cp := make(map[int]Value, len(nr.Values))
+	for k, v := range nr.Values {
+		if v.Blob != nil {
+			v.Blob = slices.Clone(v.Blob)
+		}
+		cp[k] = v
+	}
+	return NewRow{ID: nr.ID, Values: cp}
 }
 
 // Inserts returns a snapshot of staged inserted rows.
@@ -216,23 +308,23 @@ func (cs *ChangeSet) Inserts() []NewRow {
 	defer cs.mu.Unlock()
 	out := make([]NewRow, len(cs.inserts))
 	for i, r := range cs.inserts {
-		cp := map[int]Value{}
-		for k, v := range r.Values {
-			cp[k] = v
-		}
-		out[i] = NewRow{ID: r.ID, Values: cp}
+		out[i] = cloneNewRow(r)
 	}
 	return out
 }
 
-// Lookup returns any staged override for (rowid, col) and whether the row is
-// marked for deletion.
+// Lookup returns any staged override for existing DB rowid and col.
 func (cs *ChangeSet) Lookup(rowid int64, col int) (val Value, edited bool, deleted bool) {
+	return cs.LookupKey(RowKey{ID: rowid}, col)
+}
+
+// LookupKey returns any staged override for key and col.
+func (cs *ChangeSet) LookupKey(key RowKey, col int) (val Value, edited bool, deleted bool) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	if rowid < 0 {
+	if key.Inserted {
 		for _, r := range cs.inserts {
-			if r.ID == rowid {
+			if r.ID == key.ID {
 				v, ok := r.Values[col]
 				if !ok {
 					return NullValue(), true, false
@@ -242,8 +334,8 @@ func (cs *ChangeSet) Lookup(rowid int64, col int) (val Value, edited bool, delet
 		}
 		return NullValue(), false, false
 	}
-	deleted = cs.deletes[rowid]
-	if m := cs.updates[rowid]; m != nil {
+	deleted = cs.deletes[key.ID]
+	if m := cs.updates[key.ID]; m != nil {
 		if e, ok := m[col]; ok {
 			return e.New, true, deleted
 		}
@@ -270,22 +362,37 @@ func (cs *ChangeSet) Undo() bool {
 	switch u.kind {
 	case opUpdateCell:
 		if u.hadPrev {
-			cs.applyCellLocked(u.rowid, u.col, u.prev.Orig, u.prev.New)
+			cs.applyCellLocked(u.key.ID, u.col, u.prev.Orig, u.prev.New)
 		} else {
-			cs.applyCellLocked(u.rowid, u.col, u.next.Orig, u.next.Orig)
+			cs.applyCellLocked(u.key.ID, u.col, u.next.Orig, u.next.Orig)
 		}
 	case opDeleteRow:
-		delete(cs.deletes, u.rowid)
+		delete(cs.deletes, u.key.ID)
 	case opUndeleteRow:
-		cs.deletes[u.rowid] = true
+		cs.deletes[u.key.ID] = true
 	case opInsertRow:
 		for i := range cs.inserts {
-			if cs.inserts[i].ID == u.rowid {
-				u.newRow = cs.inserts[i]
+			if cs.inserts[i].ID == u.key.ID {
+				u.insIdx = i
+				u.newRow = cloneNewRow(cs.inserts[i])
 				cs.inserts = slices.Delete(cs.inserts, i, i+1)
 				break
 			}
 		}
+	case opUpdateInsertCell:
+		for i := range cs.inserts {
+			if cs.inserts[i].ID == u.key.ID {
+				if u.hadPrev {
+					cs.inserts[i].Values[u.col] = u.prevVal
+				} else {
+					delete(cs.inserts[i].Values, u.col)
+				}
+				break
+			}
+		}
+	case opDeleteInsertRow:
+		idx := max(0, min(len(cs.inserts), u.insIdx))
+		cs.inserts = slices.Insert(cs.inserts, idx, cloneNewRow(u.newRow))
 	}
 	cs.redo = append(cs.redo, u)
 	return true
@@ -302,13 +409,28 @@ func (cs *ChangeSet) Redo() bool {
 	cs.redo = cs.redo[:len(cs.redo)-1]
 	switch u.kind {
 	case opUpdateCell:
-		cs.applyCellLocked(u.rowid, u.col, u.next.Orig, u.next.New)
+		cs.applyCellLocked(u.key.ID, u.col, u.next.Orig, u.next.New)
 	case opDeleteRow:
-		cs.deletes[u.rowid] = true
+		cs.deletes[u.key.ID] = true
 	case opUndeleteRow:
-		delete(cs.deletes, u.rowid)
+		delete(cs.deletes, u.key.ID)
 	case opInsertRow:
-		cs.inserts = append(cs.inserts, u.newRow)
+		idx := max(0, min(len(cs.inserts), u.insIdx))
+		cs.inserts = slices.Insert(cs.inserts, idx, cloneNewRow(u.newRow))
+	case opUpdateInsertCell:
+		for i := range cs.inserts {
+			if cs.inserts[i].ID == u.key.ID {
+				cs.inserts[i].Values[u.col] = u.newVal
+				break
+			}
+		}
+	case opDeleteInsertRow:
+		for i := range cs.inserts {
+			if cs.inserts[i].ID == u.key.ID {
+				cs.inserts = slices.Delete(cs.inserts, i, i+1)
+				break
+			}
+		}
 	}
 	cs.undo = append(cs.undo, u)
 	return true
@@ -321,8 +443,34 @@ func (cs *ChangeSet) PreviewSQL() string {
 	defer cs.mu.Unlock()
 
 	var b strings.Builder
-	tbl := "main." + engine.QuoteIdent(cs.table)
 	b.WriteString("BEGIN IMMEDIATE;\n")
+	for _, q := range cs.buildStatementsLocked() {
+		b.WriteString(q)
+		b.WriteString(";\n")
+	}
+	b.WriteString("COMMIT;")
+	return b.String()
+}
+
+type stmtOp struct {
+	sql         string
+	expectRow   bool
+	conflictMsg string
+}
+
+func (cs *ChangeSet) buildStatementsLocked() []string {
+	tbl := "main." + engine.QuoteIdent(cs.table)
+	var out []string
+	for _, op := range cs.buildOpsLocked() {
+		out = append(out, op.sql)
+	}
+	_ = tbl
+	return out
+}
+
+func (cs *ChangeSet) buildOpsLocked() []stmtOp {
+	tbl := "main." + engine.QuoteIdent(cs.table)
+	var ops []stmtOp
 
 	// 1. Updates in deterministic rowid order.
 	rowids := make([]int64, 0, len(cs.updates))
@@ -346,8 +494,11 @@ func (cs *ChangeSet) PreviewSQL() string {
 			sets = append(sets, fmt.Sprintf("%s = %s", cname, formatLiteral(ed.New, cs.cols[c].Type)))
 			guards = append(guards, fmt.Sprintf("%s IS %s", cname, formatLiteral(ed.Orig, cs.cols[c].Type)))
 		}
-		fmt.Fprintf(&b, "UPDATE %s SET %s WHERE rowid = %d AND %s;\n",
-			tbl, strings.Join(sets, ", "), id, strings.Join(guards, " AND "))
+		ops = append(ops, stmtOp{
+			sql:         fmt.Sprintf("UPDATE %s SET %s WHERE rowid = %d AND %s", tbl, strings.Join(sets, ", "), id, strings.Join(guards, " AND ")),
+			expectRow:   true,
+			conflictMsg: fmt.Sprintf("conflict on rowid %d: row was modified or deleted concurrently", id),
+		})
 	}
 
 	// 2. Deletes in deterministic rowid order.
@@ -357,7 +508,11 @@ func (cs *ChangeSet) PreviewSQL() string {
 	}
 	slices.Sort(delIDs)
 	for _, id := range delIDs {
-		fmt.Fprintf(&b, "DELETE FROM %s WHERE rowid = %d;\n", tbl, id)
+		ops = append(ops, stmtOp{
+			sql:         fmt.Sprintf("DELETE FROM %s WHERE rowid = %d", tbl, id),
+			expectRow:   true,
+			conflictMsg: fmt.Sprintf("conflict deleting rowid %d: row no longer exists", id),
+		})
 	}
 
 	// 3. Inserts.
@@ -368,22 +523,23 @@ func (cs *ChangeSet) PreviewSQL() string {
 				continue
 			}
 			v, ok := ins.Values[i]
-			if !ok || (v.Null && (c.PK > 0 || c.HasDflt)) {
+			autoPK := c.PK > 0 && strings.EqualFold(c.Type, "INTEGER")
+			if !ok || (v.Null && (autoPK || c.HasDflt)) {
 				continue
 			}
 			colNames = append(colNames, engine.QuoteIdent(c.Name))
 			vals = append(vals, formatLiteral(v, c.Type))
 		}
+		var q string
 		if len(colNames) == 0 {
-			fmt.Fprintf(&b, "INSERT INTO %s DEFAULT VALUES;\n", tbl)
+			q = fmt.Sprintf("INSERT INTO %s DEFAULT VALUES", tbl)
 		} else {
-			fmt.Fprintf(&b, "INSERT INTO %s (%s) VALUES (%s);\n",
+			q = fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
 				tbl, strings.Join(colNames, ", "), strings.Join(vals, ", "))
 		}
+		ops = append(ops, stmtOp{sql: q})
 	}
-
-	b.WriteString("COMMIT;")
-	return b.String()
+	return ops
 }
 
 // Apply executes all staged changes inside a single transaction on db, checking
@@ -400,76 +556,12 @@ func (cs *ChangeSet) Apply(db *sqlite3.Conn) error {
 		return err
 	}
 
-	tbl := "main." + engine.QuoteIdent(cs.table)
-
-	rowids := make([]int64, 0, len(cs.updates))
-	for id := range cs.updates {
-		if !cs.deletes[id] {
-			rowids = append(rowids, id)
-		}
-	}
-	slices.Sort(rowids)
-	for _, id := range rowids {
-		m := cs.updates[id]
-		cols := make([]int, 0, len(m))
-		for c := range m {
-			cols = append(cols, c)
-		}
-		slices.Sort(cols)
-		var sets, guards []string
-		for _, c := range cols {
-			ed := m[c]
-			cname := engine.QuoteIdent(cs.cols[c].Name)
-			sets = append(sets, fmt.Sprintf("%s = %s", cname, formatLiteral(ed.New, cs.cols[c].Type)))
-			guards = append(guards, fmt.Sprintf("%s IS %s", cname, formatLiteral(ed.Orig, cs.cols[c].Type)))
-		}
-		q := fmt.Sprintf("UPDATE %s SET %s WHERE rowid = %d AND %s",
-			tbl, strings.Join(sets, ", "), id, strings.Join(guards, " AND "))
-		if err := db.Exec(q); err != nil {
+	for _, op := range cs.buildOpsLocked() {
+		if err := db.Exec(op.sql); err != nil {
 			return rollback(err)
 		}
-		if db.Changes() == 0 {
-			return rollback(fmt.Errorf("conflict on rowid %d: row was modified or deleted concurrently", id))
-		}
-	}
-
-	delIDs := make([]int64, 0, len(cs.deletes))
-	for id := range cs.deletes {
-		delIDs = append(delIDs, id)
-	}
-	slices.Sort(delIDs)
-	for _, id := range delIDs {
-		q := fmt.Sprintf("DELETE FROM %s WHERE rowid = %d", tbl, id)
-		if err := db.Exec(q); err != nil {
-			return rollback(err)
-		}
-		if db.Changes() == 0 {
-			return rollback(fmt.Errorf("conflict deleting rowid %d: row no longer exists", id))
-		}
-	}
-
-	for _, ins := range cs.inserts {
-		var colNames, vals []string
-		for i, c := range cs.cols {
-			if c.Hidden >= 2 {
-				continue
-			}
-			v, ok := ins.Values[i]
-			if !ok || (v.Null && (c.PK > 0 || c.HasDflt)) {
-				continue
-			}
-			colNames = append(colNames, engine.QuoteIdent(c.Name))
-			vals = append(vals, formatLiteral(v, c.Type))
-		}
-		var q string
-		if len(colNames) == 0 {
-			q = fmt.Sprintf("INSERT INTO %s DEFAULT VALUES", tbl)
-		} else {
-			q = fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-				tbl, strings.Join(colNames, ", "), strings.Join(vals, ", "))
-		}
-		if err := db.Exec(q); err != nil {
-			return rollback(err)
+		if op.expectRow && db.Changes() == 0 {
+			return rollback(fmt.Errorf("%s", op.conflictMsg))
 		}
 	}
 
@@ -486,12 +578,28 @@ func (cs *ChangeSet) Apply(db *sqlite3.Conn) error {
 }
 
 func formatLiteral(v Value, declType string) string {
-	if v.Null {
+	if v.Null || v.Kind == KindNull {
 		return "NULL"
 	}
-	if v.Blob != nil {
+	if v.Kind == KindBlob || (v.Kind == KindAuto && v.Blob != nil) {
 		return sqlite3.Quote(v.Blob)
 	}
+	switch v.Kind {
+	case KindText:
+		return sqlite3.Quote(v.Text)
+	case KindInt:
+		if n, err := strconv.ParseInt(strings.TrimSpace(v.Text), 10, 64); err == nil {
+			return strconv.FormatInt(n, 10)
+		}
+		return sqlite3.Quote(v.Text)
+	case KindReal:
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v.Text), 64); err == nil {
+			return strconv.FormatFloat(f, 'g', -1, 64)
+		}
+		return sqlite3.Quote(v.Text)
+	}
+
+	// KindAuto: coerce new text input according to column declared affinity.
 	up := strings.ToUpper(declType)
 	if strings.Contains(up, "INT") {
 		if n, err := strconv.ParseInt(strings.TrimSpace(v.Text), 10, 64); err == nil {

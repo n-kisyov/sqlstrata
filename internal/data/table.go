@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"slices"
 	"strconv"
@@ -29,6 +30,7 @@ const (
 type CellDetail struct {
 	Row        int64
 	Rowid      int64
+	Offset     int64
 	Col        int
 	Kind       Kind
 	TotalBytes int64
@@ -305,17 +307,19 @@ func buildFilterSQL(raw string, cols []engine.Column) string {
 	if raw == "" {
 		return ""
 	}
-	// If the user wrote a SQL expression (contains operators or SQL keywords),
-	// use it directly as a WHERE predicate.
+	// Treat raw as a SQL WHERE predicate when it contains SQL operators/parens or
+	// multi-token SQL keyword clauses (so bare search words like "in" or "or"
+	// still perform a substring search).
 	up := " " + strings.ToUpper(raw) + " "
-	if strings.ContainsAny(raw, "=<>!()") ||
-		strings.Contains(up, " LIKE ") ||
+	hasOp := strings.ContainsAny(raw, "=<>!()")
+	hasKeywordClause := len(strings.Fields(raw)) >= 2 && (strings.Contains(up, " LIKE ") ||
 		strings.Contains(up, " IS ") ||
 		strings.Contains(up, " IN ") ||
 		strings.Contains(up, " AND ") ||
 		strings.Contains(up, " OR ") ||
 		strings.Contains(up, " BETWEEN ") ||
-		strings.Contains(up, " GLOB ") {
+		strings.Contains(up, " GLOB "))
+	if hasOp || hasKeywordClause {
 		return raw
 	}
 	// Otherwise treat raw as a substring search across all non-blob columns.
@@ -387,9 +391,12 @@ func (s *TableSource) Cell(row int64, col int) (text string, kind Kind, trunc bo
 		return "", KindLoading, false, false
 	}
 	if s.changes != nil && s.byRowid {
-		if v, edited, _ := s.changes.Lookup(rowid, col); edited {
+		if v, edited, _ := s.changes.LookupKey(edit.RowKey{ID: rowid}, col); edited {
 			if v.Null {
 				return "", KindNull, false, true
+			}
+			if v.Kind == edit.KindBlob || (v.Kind == edit.KindAuto && v.Blob != nil) {
+				return "BLOB " + FormatSize(int64(len(v.Blob))), KindBlob, false, true
 			}
 			return v.Text, inferKind(v.Text, s.cols[col].Type), false, true
 		}
@@ -402,45 +409,62 @@ func (s *TableSource) CellStatus(row int64, col int) (edited, rowDeleted, rowIns
 	if s.changes == nil {
 		return false, false, false
 	}
-	s.mu.Lock()
-	baseCount := s.count
-	s.mu.Unlock()
-	if row >= baseCount {
-		return true, false, true
-	}
-	rowid, ok := s.RowKey(row)
+	key, ok := s.RowKey(row)
 	if !ok {
 		return false, false, false
 	}
-	_, edited, rowDeleted = s.changes.Lookup(rowid, col)
+	if key.Inserted {
+		return true, false, true
+	}
+	_, edited, rowDeleted = s.changes.LookupKey(key, col)
 	return edited, rowDeleted, false
 }
 
-// StageCellEdit stages an edit to (row, col), automatically capturing the
-// original database value for optimistic concurrency checking.
+// StageCellEdit stages an edit to (row, col), capturing the original database
+// value from the loaded grid page. For truncated text cells (> PreviewBytes),
+// returns false so callers supply the full original value via StageCellEditWithOrig.
 func (s *TableSource) StageCellEdit(row int64, col int, newVal edit.Value) bool {
+	return s.StageCellEditWithOrig(row, col, edit.Value{}, false, newVal)
+}
+
+// StageCellEditWithOrig stages an edit to (row, col), using fullOrig if supplied
+// or falling back to the cached page cell when untruncated.
+func (s *TableSource) StageCellEditWithOrig(row int64, col int, fullOrig edit.Value, hasOrig bool, newVal edit.Value) bool {
 	if s.changes == nil || col < 0 || col >= len(s.cols) {
 		return false
 	}
-	rowid, ok := s.RowKey(row)
+	key, ok := s.RowKey(row)
 	if !ok {
 		return false
 	}
 	var orig edit.Value
-	if rowid > 0 {
-		rawTxt, rawKind, _, _, loaded := s.rawCell(row, col)
-		if !loaded {
-			return false
-		}
-		if rawKind == KindNull {
-			orig = edit.NullValue()
+	if !key.Inserted {
+		if hasOrig {
+			orig = fullOrig
 		} else {
-			orig = edit.TextValue(rawTxt)
+			rawTxt, rawKind, rawTrunc, _, loaded := s.rawCell(row, col)
+			if !loaded || rawTrunc || rawKind == KindBlob {
+				return false
+			}
+			orig = rawCellToEditValue(rawKind, rawTxt)
 		}
 	}
-	s.changes.SetCell(rowid, col, orig, newVal)
+	s.changes.SetCellKey(key, col, orig, newVal)
 	s.invalidate()
 	return true
+}
+
+func rawCellToEditValue(k Kind, txt string) edit.Value {
+	switch k {
+	case KindNull:
+		return edit.NullValue()
+	case KindInteger:
+		return edit.ExactValue(edit.KindInt, txt, nil)
+	case KindReal:
+		return edit.ExactValue(edit.KindReal, txt, nil)
+	default:
+		return edit.ExactValue(edit.KindText, txt, nil)
+	}
 }
 
 func inferKind(txt, declType string) Kind {
@@ -480,9 +504,9 @@ func (s *TableSource) rawCell(row int64, col int) (txt string, kind Kind, trunc 
 	return t, k, tr, key, true
 }
 
-// RowKey returns the rowid of a loaded row (or the negative staged ID of an
-// inserted row).
-func (s *TableSource) RowKey(row int64) (int64, bool) {
+// RowKey returns the edit.RowKey of a loaded database row (with any int64 rowid,
+// including <= 0) or a staged inserted row.
+func (s *TableSource) RowKey(row int64) (edit.RowKey, bool) {
 	s.mu.Lock()
 	baseCount := s.count
 	p := s.pages[row/PageRows]
@@ -492,80 +516,103 @@ func (s *TableSource) RowKey(row int64) (int64, bool) {
 		ins := s.changes.Inserts()
 		idx := int(row - baseCount)
 		if idx >= 0 && idx < len(ins) {
-			return ins[idx].ID, true
+			return edit.RowKey{ID: ins[idx].ID, Inserted: true}, true
 		}
-		return 0, false
+		return edit.RowKey{}, false
 	}
 	if p == nil || p.keys == nil || int(row%PageRows) >= p.nrows {
-		return 0, false
+		return edit.RowKey{}, false
 	}
-	return p.keys[row%PageRows], true
+	return edit.RowKey{ID: p.keys[row%PageRows]}, true
 }
 
-// FetchCellDetail loads up to maxBytes of the cell at (row, col) on the
-// foreground connection and delivers it to cb.
+// FetchCellDetail loads up to maxBytes starting at offset 0 for (row, col).
 func (s *TableSource) FetchCellDetail(row int64, col int, maxBytes int, cb func(CellDetail, error)) {
+	s.FetchCellDetailAt(row, col, 0, maxBytes, cb)
+}
+
+// FetchCellDetailAt loads up to maxBytes of the cell at (row, col) starting from
+// byte offset (using SQLite incremental BLOB I/O for BLOB columns) on the
+// foreground connection and delivers it to cb.
+func (s *TableSource) FetchCellDetailAt(row int64, col int, offset int64, maxBytes int, cb func(CellDetail, error)) {
 	if col < 0 || col >= len(s.cols) {
 		return
+	}
+	if offset < 0 {
+		offset = 0
 	}
 	if maxBytes <= 0 {
 		maxBytes = 64 * 1024
 	}
-	rowid, hasKey := s.RowKey(row)
+	key, hasKey := s.RowKey(row)
 	if s.changes != nil && hasKey {
-		if v, edited, _ := s.changes.Lookup(rowid, col); edited {
+		if v, edited, _ := s.changes.LookupKey(key, col); edited {
 			k := inferKind(v.Text, s.cols[col].Type)
-			var data []byte
+			var payload []byte
 			if v.Null {
 				k = KindNull
+			} else if v.Kind == edit.KindBlob || (v.Kind == edit.KindAuto && v.Blob != nil) {
+				k = KindBlob
+				payload = slices.Clone(v.Blob)
 			} else {
-				data = []byte(v.Text)
+				payload = []byte(v.Text)
 			}
+			total := int64(len(payload))
+			start := min(total, offset)
+			end := min(total, start+int64(maxBytes))
 			cb(CellDetail{
 				Row:        row,
-				Rowid:      rowid,
+				Rowid:      key.ID,
+				Offset:     start,
 				Col:        col,
 				Kind:       k,
-				TotalBytes: int64(len(data)),
-				Data:       data,
+				TotalBytes: total,
+				Data:       payload[start:end],
+				Truncated:  end < total || start > 0,
 			}, nil)
 			return
 		}
 	}
 
-	colIdent := engine.QuoteIdent(s.cols[col].Name)
+	colName := s.cols[col].Name
+	colIdent := engine.QuoteIdent(colName)
 	from := s.from
-	byRowid := s.byRowid && hasKey && rowid > 0
+	byRowid := s.byRowid && hasKey && !key.Inserted
+	canOpenBlob := byRowid && s.obj.Type == engine.TypeTable && !s.obj.WithoutRowid
 
 	s.db.Fg.Go(s.ctx, func(db *sqlite3.Conn) error {
-		var q string
+		// Step 1: check storage class cleanly.
+		var typQ string
 		if byRowid {
-			q = fmt.Sprintf("SELECT typeof(%[1]s), length(%[1]s), substr(%[1]s, 1, %[2]d) FROM %[3]s WHERE rowid = ?",
-				colIdent, maxBytes, from)
+			typQ = fmt.Sprintf("SELECT typeof(%s) FROM %s WHERE rowid = ?", colIdent, from)
 		} else {
-			q = fmt.Sprintf("SELECT typeof(%[1]s), length(%[1]s), substr(%[1]s, 1, %[2]d) FROM %[3]s LIMIT 1 OFFSET ?",
-				colIdent, maxBytes, from)
+			typQ = fmt.Sprintf("SELECT typeof(%s) FROM %s LIMIT 1 OFFSET ?", colIdent, from)
 		}
-		stmt, _, err := db.Prepare(q)
+		stmtTyp, _, err := db.Prepare(typQ)
 		if err != nil {
 			return err
 		}
-		defer stmt.Close()
 		if byRowid {
-			_ = stmt.BindInt64(1, rowid)
+			_ = stmtTyp.BindInt64(1, key.ID)
 		} else {
-			_ = stmt.BindInt64(1, row)
+			_ = stmtTyp.BindInt64(1, row)
 		}
-		if !stmt.Step() {
-			return stmt.Err()
+		if !stmtTyp.Step() {
+			err := stmtTyp.Err()
+			_ = stmtTyp.Close()
+			return err
 		}
-		var det CellDetail
-		det.Row = row
-		det.Rowid = rowid
-		det.Col = col
-		switch stmt.ColumnText(0) {
+		typStr := stmtTyp.ColumnText(0)
+		if err := stmtTyp.Close(); err != nil {
+			return err
+		}
+
+		det := CellDetail{Row: row, Rowid: key.ID, Offset: offset, Col: col}
+		switch typStr {
 		case "null":
 			det.Kind = KindNull
+			cb(det, nil)
+			return nil
 		case "integer":
 			det.Kind = KindInteger
 		case "real":
@@ -575,16 +622,69 @@ func (s *TableSource) FetchCellDetail(row int64, col int, maxBytes int, cb func(
 		case "blob":
 			det.Kind = KindBlob
 		}
-		if det.Kind != KindNull {
-			raw := stmt.ColumnRawBlob(2)
-			det.Data = slices.Clone(raw)
-			if det.Kind == KindBlob {
-				det.TotalBytes = stmt.ColumnInt64(1)
-			} else {
-				det.TotalBytes = int64(len(det.Data))
+
+		// Step 2: use SQLite incremental BLOB I/O for BLOBs when possible.
+		if det.Kind == KindBlob && canOpenBlob {
+			if b, berr := db.OpenBlob("main", s.obj.Name, colName, key.ID, false); berr == nil {
+				defer b.Close()
+				det.TotalBytes = b.Size()
+				if offset < det.TotalBytes {
+					if _, serr := b.Seek(offset, io.SeekStart); serr != nil {
+						return serr
+					}
+					want := int(min(int64(maxBytes), det.TotalBytes-offset))
+					buf := make([]byte, want)
+					n, rerr := io.ReadFull(b, buf)
+					if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
+						return rerr
+					}
+					det.Data = buf[:n]
+				}
+				det.Truncated = offset+int64(len(det.Data)) < det.TotalBytes || offset > 0
+				cb(det, nil)
+				return nil
 			}
-			det.Truncated = int64(len(det.Data)) < det.TotalBytes || len(det.Data) >= maxBytes
 		}
+
+		// Step 3: text/numeric or non-rowid fallback.
+		var q string
+		if byRowid {
+			if offset > 0 {
+				q = fmt.Sprintf("SELECT length(%[1]s), substr(%[1]s, ?, ?) FROM %[2]s WHERE rowid = ?", colIdent, from)
+			} else {
+				q = fmt.Sprintf("SELECT length(%[1]s), substr(%[1]s, 1, ?) FROM %[2]s WHERE rowid = ?", colIdent, from)
+			}
+		} else {
+			q = fmt.Sprintf("SELECT length(%[1]s), substr(%[1]s, 1, ?) FROM %[2]s LIMIT 1 OFFSET ?", colIdent, from)
+		}
+		stmt, _, err := db.Prepare(q)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		switch {
+		case byRowid && offset > 0:
+			_ = stmt.BindInt64(1, offset+1)
+			_ = stmt.BindInt(2, maxBytes)
+			_ = stmt.BindInt64(3, key.ID)
+		case byRowid:
+			_ = stmt.BindInt(1, maxBytes)
+			_ = stmt.BindInt64(2, key.ID)
+		default:
+			_ = stmt.BindInt(1, maxBytes)
+			_ = stmt.BindInt64(2, row)
+		}
+		if !stmt.Step() {
+			return stmt.Err()
+		}
+		raw := stmt.ColumnRawBlob(1)
+		det.Data = slices.Clone(raw)
+		if det.Kind == KindBlob {
+			det.TotalBytes = stmt.ColumnInt64(0)
+		} else {
+			det.TotalBytes = int64(len(det.Data))
+		}
+		det.Truncated = offset+int64(len(det.Data)) < det.TotalBytes || len(det.Data) >= maxBytes || offset > 0
 		cb(det, nil)
 		return nil
 	}, func(err error) {
@@ -754,6 +854,19 @@ func (s *TableSource) planLocked(p int64) fetchPlan {
 			k := nxt.keys[0]
 			return fetchPlan{after: &k, rowidDesc: true}
 		}
+		if s.anchorsOK && s.countState == CountExact && s.count > 0 && len(s.anchors) > 0 {
+			rem := (s.count - 1) - start
+			if rem > 0 {
+				k := (rem + AnchorStride - 1) / AnchorStride
+				if k < int64(len(s.anchors)) {
+					a := s.anchors[k]
+					descPos := (s.count - 1) - k*AnchorStride
+					if start >= descPos {
+						return fetchPlan{anchor: &a, offset: start - descPos, rowidDesc: true}
+					}
+				}
+			}
+		}
 		return fetchPlan{offset: start, rowidDesc: true}
 	}
 
@@ -799,6 +912,9 @@ func (s *TableSource) fetch(db *sqlite3.Conn, p int64, plan fetchPlan) (*page, e
 		q += " WHERE rowid > ? ORDER BY rowid ASC LIMIT " + strconv.Itoa(PageRows)
 		args = append(args, *plan.after)
 		reverse = true
+	case plan.rowidDesc && plan.anchor != nil:
+		q += " WHERE rowid <= ? ORDER BY rowid DESC LIMIT " + strconv.Itoa(PageRows) + " OFFSET ?"
+		args = append(args, *plan.anchor, plan.offset)
 	case plan.rowidDesc:
 		q += " ORDER BY rowid DESC LIMIT " + strconv.Itoa(PageRows) + " OFFSET ?"
 		args = append(args, plan.offset)
