@@ -15,3 +15,4 @@ func init() {
 		return dsn
 	}
 }
+

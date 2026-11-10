@@ -10,7 +10,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -42,11 +41,11 @@ func DefaultOptions() Options {
 
 // Conn is a single SQLite connection bound to a worker goroutine.
 type Conn struct {
-	name  string
-	jobs  chan job
-	done  chan struct{}
-	once  sync.Once
-	mu    sync.Mutex // guards closed and jobs sends
+	name   string
+	jobs   chan job
+	done   chan struct{}
+	once   sync.Once
+	mu     sync.Mutex // guards closed and jobs sends
 	closed bool
 }
 
@@ -121,22 +120,17 @@ func configure(db *sqlite3.Conn, opt Options) error {
 }
 
 func buildURI(path string, ro bool) string {
-	abs, err := filepath.Abs(path)
-	if err == nil {
+	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
-	u := url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
-	if !strings.HasPrefix(u.Path, "/") {
-		u.Path = "/" + u.Path // file:///C:/x.db
-	}
-	q := url.Values{}
+	// file:C:/dir/x.db?mode=ro. Only the characters that are special in an
+	// SQLite URI path need escaping.
+	esc := strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23").Replace(filepath.ToSlash(path))
+	mode := "rwc"
 	if ro {
-		q.Set("mode", "ro")
-	} else {
-		q.Set("mode", "rwc")
+		mode = "ro"
 	}
-	u.RawQuery = q.Encode()
-	return u.String()
+	return "file:" + esc + "?mode=" + mode
 }
 
 // Do runs fn on the connection's goroutine and waits for it to finish.

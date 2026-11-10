@@ -19,13 +19,13 @@ const (
 
 // Column describes one column of a table or view (PRAGMA table_xinfo).
 type Column struct {
-	Name     string
-	Type     string
-	NotNull  bool
-	Default  string // SQL text of the default, "" if none
-	HasDflt  bool
-	PK       int // 1-based position in the primary key, 0 if not part of it
-	Hidden   int // 0 normal, 1 hidden (vtab), 2 generated virtual, 3 generated stored
+	Name    string
+	Type    string
+	NotNull bool
+	Default string // SQL text of the default, "" if none
+	HasDflt bool
+	PK      int // 1-based position in the primary key, 0 if not part of it
+	Hidden  int // 0 normal, 1 hidden (vtab), 2 generated virtual, 3 generated stored
 }
 
 // Object is an entry of sqlite_schema with resolved details.
